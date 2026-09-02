@@ -4,22 +4,19 @@ import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { useConfig } from '@/contexts/ConfigContext';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { AGE_RATING_OPTIONS as ageRatingOptions } from '@/lib/ageRatings';
 
-// Define the options for the age rating select dropdown
-const ageRatingOptions = [
-    { value: 'None', label: 'None (Show All)' },
-    { value: 'G', label: 'G (All Ages)' },
-    { value: 'PG', label: 'PG (Parental Guidance)' },
-    { value: 'PG-13', label: 'PG-13 (Parents Strongly Cautioned)' },
-    { value: 'R', label: 'R (Restricted)' },
-    { value: 'NC-17', label: 'NC-17 (Adults Only)' },
-];
 
 export function FiltersSettings() {
   const { config, setConfig } = useConfig();
+  const hasAgeRatingCap = !!config.ageRating && config.ageRating !== 'None';
 
   const handleAgeRatingChange = (value: string) => {
     setConfig(prev => ({ ...prev, ageRating: value }));
+  };
+
+  const handleAllowUnratedChange = (checked: boolean) => {
+    setConfig(prev => ({ ...prev, allowUnratedContent: checked }));
   };
 
   const handleSfwChange = (checked: boolean) => {
@@ -72,14 +69,40 @@ export function FiltersSettings() {
             </CardDescription>
           </CardHeader>
           <CardContent>
+            <div className="flex flex-col space-y-4">
               <Select value={config.ageRating} onValueChange={handleAgeRatingChange}>
-                <SelectTrigger className="w-full">
+                <SelectTrigger className="w-full" data-setting="age-rating" aria-label="Maximum content rating">
                   <SelectValue placeholder="Select a rating" />
                 </SelectTrigger>
                 <SelectContent>
                   {ageRatingOptions.map(opt => <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>)}
                 </SelectContent>
               </Select>
+              {/* Also shown when it is off with no limit set: an install URL can carry a
+                  limit of its own, and that reads this, so it must not be unreachable. */}
+              {(hasAgeRatingCap || config.allowUnratedContent === false) && (
+                <div className="space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <Switch
+                      id="allow-unrated-content"
+                      data-setting="allow-unrated-content"
+                      checked={config.allowUnratedContent !== false}
+                      onCheckedChange={handleAllowUnratedChange}
+                    />
+                    <Label htmlFor="allow-unrated-content">Show Unrated Titles</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Most catalog rows carry no rating at all, so turning this off leaves them nearly empty.
+                    Turn it off only if you would rather hide anything whose rating cannot be confirmed.
+                  </p>
+                  {!hasAgeRatingCap && (
+                    <p className="text-xs text-muted-foreground">
+                      With no limit set above, this only applies to an install URL that carries one.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
 
@@ -162,15 +185,16 @@ export function FiltersSettings() {
       </div>
 
       {/* Hide Watched Card */}
-      {(config.apiKeys?.traktTokenId || config.apiKeys?.anilistTokenId || config.apiKeys?.mdblist) && (
+      {(config.apiKeys?.traktTokenId || config.apiKeys?.anilistTokenId || config.apiKeys?.mdblist || config.apiKeys?.simklTokenId) && (
         <Card>
           <CardHeader>
             <CardTitle>Hide Watched</CardTitle>
             <CardDescription className="space-y-2 mt-2">
-              <p>Hide items you've already watched on Trakt, AniList, or MDBList from all catalogs.</p>
+              <p>Hide items you've already watched on Trakt, AniList, MDBList or Simkl from all catalogs.</p>
               <ul className="list-disc list-inside ml-2 space-y-1">
                 <li><strong>Trakt & MDBList:</strong> Refreshes every 5 minutes</li>
                 <li><strong>AniList:</strong> Refreshes every 24 hours</li>
+                <li><strong>Simkl:</strong> Refreshes every 6 hours by default</li>
               </ul>
               <p className="text-muted-foreground mt-2">
                 Note: Does not apply to search results, watchlists, or up-next catalogs.
@@ -206,6 +230,16 @@ export function FiltersSettings() {
                   onCheckedChange={(checked) => setConfig(prev => ({ ...prev, hideWatchedMdblist: checked }))}
                 />
                 <Label htmlFor="hide-watched-mdblist">Hide MDBList Watched Items</Label>
+              </div>
+            )}
+            {config.apiKeys?.simklTokenId && (
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="hide-watched-simkl"
+                  checked={config.hideWatchedSimkl ?? false}
+                  onCheckedChange={(checked) => setConfig(prev => ({ ...prev, hideWatchedSimkl: checked }))}
+                />
+                <Label htmlFor="hide-watched-simkl">Hide Simkl Watched Items</Label>
               </div>
             )}
           </CardContent>

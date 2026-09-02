@@ -91,11 +91,39 @@ node addon/server.js
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `MONGODB_URI` | MongoDB connection URI | Yes |
-| `FANART_API` | Fanart.tv API key | Yes |
-| `TMDB_API_KEY` | TMDB API key (legacy: `TMDB_API` also supported) | Yes |
-| `RPDB_API_KEY` | RPDB API key | No |
+| `BUILT_IN_TMDB_API_KEY` | TMDB key kept on the server, used for users with no key of their own | No |
+| `BUILT_IN_TVDB_API_KEY` | TVDB key kept on the server | No |
+| `BUILT_IN_FANART_API_KEY` | Fanart.tv key kept on the server | No |
+| `BUILT_IN_RPDB_API_KEY` | RPDB key kept on the server | No |
+| `FANART_API` | Fanart.tv API key, published to the browser | Yes |
+| `TMDB_API_KEY` | TMDB API key, published to the browser (legacy: `TMDB_API` also supported) | Yes |
+| `RPDB_API_KEY` | RPDB API key, published to the browser | No |
 | `HOST_NAME` | Public URL of your addon (e.g., http://your_domain:3232) | Yes |
 | `PORT` | Server port (default: 3232) | No |
+
+> **Running this for other people?** Use the `BUILT_IN_*` keys. They cover any user
+> who brings no key of their own and are never sent to the browser.
+>
+> `TMDB_API_KEY`, `TVDB_API_KEY`, `FANART_API_KEY`, `RPDB_API_KEY`, `MDBLIST_API_KEY`
+> and `GEMINI_API_KEY` are served to every visitor by `/api/config` so the configure
+> page can prefill them, and that path stays open even with `AUTH_REQUIRE_SIGNIN=true`.
+> (`TRAKT_CLIENT_ID` and `SIMKL_CLIENT_ID` are in there too, which is fine: OAuth
+> client ids are public by design and their secrets are not published.) See
+> [Environment Variables](ENVIRONMENT_VARIABLES.md#api-keys).
+
+> **Connecting SimKL without a public URL?** The configure page can show a short
+> code to enter at https://simkl.com/pin, and the server polls SimKL for the token.
+> Only `SIMKL_CLIENT_ID` is required, no client secret and no inbound callback to
+> your instance. For a private instance:
+>
+> ```
+> SIMKL_CLIENT_ID=your_client_id
+> SIMKL_AUTH_MODE=pin
+> ```
+>
+> `pin` is already the default when no `SIMKL_CLIENT_SECRET` is set, but setting it
+> explicitly keeps the flow from switching back to OAuth if a secret is ever added.
+> See [`SIMKL_AUTH_MODE`](ENVIRONMENT_VARIABLES.md#simkl_auth_mode).
 
 ## Getting API Keys
 

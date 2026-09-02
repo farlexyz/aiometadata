@@ -5,6 +5,18 @@ import { nextTagColor } from '@/lib/tagColors';
 
 const catalogKey = (c: CatalogConfig) => `${c.id}-${c.type}`;
 
+const sameTag = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+type TagFilters = Partial<Pick<TagDef, 'ageRating' | 'allowUnratedContent'>>;
+
+/** Drops 'None' and the undefined half so a tag without a limit stores no filter keys. */
+const cleanFilters = (filters?: TagFilters): TagFilters => {
+  if (!filters?.ageRating || filters.ageRating === 'None') return {};
+  return filters.allowUnratedContent === false
+    ? { ageRating: filters.ageRating, allowUnratedContent: false }
+    : { ageRating: filters.ageRating };
+};
+
 export function useCatalogTags() {
   const { config, setConfig } = useConfig();
 
@@ -18,14 +30,14 @@ export function useCatalogTags() {
     return counts;
   }, [config.catalogs]);
 
-  const createTag = useCallback((name: string, color?: TagColorKey) => {
+  const createTag = useCallback((name: string, color?: TagColorKey, filters?: TagFilters) => {
     const clean = name.trim();
     if (!clean || clean.length > MAX_TAG_NAME_LENGTH) return;
     setConfig(prev => {
       const registry = prev.tags ?? [];
       if (registry.some(t => t.name.toLowerCase() === clean.toLowerCase())) return prev;
       const chosen = color ?? nextTagColor(registry.map(t => t.color));
-      return { ...prev, tags: [...registry, { name: clean, color: chosen }] };
+      return { ...prev, tags: [...registry, { name: clean, color: chosen, ...cleanFilters(filters) }] };
     });
   }, [setConfig]);
 
@@ -34,13 +46,13 @@ export function useCatalogTags() {
     if (!clean || clean.length > MAX_TAG_NAME_LENGTH || clean === oldName) return;
     setConfig(prev => {
       const registry = prev.tags ?? [];
-      if (registry.some(t => t.name !== oldName && t.name.toLowerCase() === clean.toLowerCase())) return prev;
+      if (registry.some(t => !sameTag(t.name, oldName) && sameTag(t.name, clean))) return prev;
       return {
         ...prev,
-        tags: registry.map(t => (t.name === oldName ? { ...t, name: clean } : t)),
+        tags: registry.map(t => (sameTag(t.name, oldName) ? { ...t, name: clean } : t)),
         catalogs: prev.catalogs.map(c =>
-          c.tags?.includes(oldName)
-            ? { ...c, tags: c.tags.map(t => (t === oldName ? clean : t)) }
+          c.tags?.some(t => sameTag(t, oldName))
+            ? { ...c, tags: c.tags.map(t => (sameTag(t, oldName) ? clean : t)) }
             : c
         ),
       };
@@ -50,21 +62,28 @@ export function useCatalogTags() {
   const recolorTag = useCallback((name: string, color: TagColorKey) => {
     setConfig(prev => ({
       ...prev,
-      tags: (prev.tags ?? []).map(t => (t.name === name ? { ...t, color } : t)),
+      tags: (prev.tags ?? []).map(t => (sameTag(t.name, name) ? { ...t, color } : t)),
+    }));
+  }, [setConfig]);
+
+  const setTagFilters = useCallback((name: string, patch: TagFilters) => {
+    setConfig(prev => ({
+      ...prev,
+      tags: (prev.tags ?? []).map(t => (sameTag(t.name, name) ? { ...t, ...patch } : t)),
     }));
   }, [setConfig]);
 
   const deleteTag = useCallback((name: string) => {
     setConfig(prev => ({
       ...prev,
-      tags: (prev.tags ?? []).filter(t => t.name !== name),
+      tags: (prev.tags ?? []).filter(t => !sameTag(t.name, name)),
       catalogs: prev.catalogs.map(c =>
-        c.tags?.includes(name) ? { ...c, tags: c.tags.filter(t => t !== name) } : c
+        c.tags?.some(t => sameTag(t, name)) ? { ...c, tags: c.tags.filter(t => !sameTag(t, name)) } : c
       ),
     }));
   }, [setConfig]);
 
-  const addTagToCatalogs = useCallback((keys: Set<string>, name: string, color?: TagColorKey) => {
+  const addTagToCatalogs = useCallback((keys: Set<string>, name: string, color?: TagColorKey, filters?: TagFilters) => {
     const clean = name.trim();
     if (!clean || clean.length > MAX_TAG_NAME_LENGTH) return;
     setConfig(prev => {
@@ -73,14 +92,14 @@ export function useCatalogTags() {
       const canonical = existing ? existing.name : clean;
       const tagsUpdate = existing
         ? registry
-        : [...registry, { name: clean, color: color ?? nextTagColor(registry.map(t => t.color)) }];
+        : [...registry, { name: clean, color: color ?? nextTagColor(registry.map(t => t.color)), ...cleanFilters(filters) }];
       return {
         ...prev,
         tags: tagsUpdate,
         catalogs: prev.catalogs.map(c => {
           if (!keys.has(catalogKey(c))) return c;
           const current = c.tags ?? [];
-          return current.includes(canonical) ? c : { ...c, tags: [...current, canonical] };
+          return current.some(t => sameTag(t, canonical)) ? c : { ...c, tags: [...current, canonical] };
         }),
       };
     });
@@ -90,8 +109,8 @@ export function useCatalogTags() {
     setConfig(prev => ({
       ...prev,
       catalogs: prev.catalogs.map(c => {
-        if (!keys.has(catalogKey(c)) || !c.tags?.includes(name)) return c;
-        return { ...c, tags: c.tags.filter(t => t !== name) };
+        if (!keys.has(catalogKey(c)) || !c.tags?.some(t => sameTag(t, name))) return c;
+        return { ...c, tags: c.tags.filter(t => !sameTag(t, name)) };
       }),
     }));
   }, [setConfig]);
@@ -102,6 +121,7 @@ export function useCatalogTags() {
     createTag,
     renameTag,
     recolorTag,
+    setTagFilters,
     deleteTag,
     addTagToCatalogs,
     removeTagFromCatalogs,

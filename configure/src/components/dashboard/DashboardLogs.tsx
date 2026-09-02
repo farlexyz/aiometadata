@@ -42,7 +42,7 @@ import {
   ChevronRight,
   ChevronDown,
 } from "lucide-react";
-import type { LogsData, LogEntry } from "@/hooks/useDashboardQueries";
+import type { LogsData, LogEntry, LogStreamFilters } from "@/hooks/useDashboardQueries";
 
 interface DashboardLogsProps {
   data: LogsData | undefined;
@@ -50,6 +50,8 @@ interface DashboardLogsProps {
   paused?: boolean;
   onPauseToggle?: () => void;
   onClear?: () => void;
+  /** Lifted so the stream can apply them to the whole buffer, not just the tail. */
+  onFiltersChange?: (filters: LogStreamFilters) => void;
 }
 
 const LEVEL_COLORS: Record<string, string> = {
@@ -74,6 +76,7 @@ function formatTime(iso: string): string {
 
 function formatEntryForCopy(entry: LogEntry): string {
   const parts = [formatTime(entry.timestamp), `[${entry.levelLabel.toUpperCase()}]`];
+  if (entry.service && entry.service !== "addon") parts.push(`<${entry.service}>`);
   if (entry.tag) parts.push(`(${entry.tag})`);
   if (entry.userId) parts.push(`{${entry.userId}}`);
   parts.push(entry.message);
@@ -84,11 +87,12 @@ function formatEntryForCopy(entry: LogEntry): string {
   return line;
 }
 
-export function DashboardLogs({ data, loading, paused = false, onPauseToggle, onClear }: DashboardLogsProps) {
+export function DashboardLogs({ data, loading, paused = false, onPauseToggle, onClear, onFiltersChange }: DashboardLogsProps) {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [levelFilter, setLevelFilter] = useState<Set<string>>(new Set());
   const [tagFilter, setTagFilter] = useState("all");
+  const [serviceFilter, setServiceFilter] = useState("all");
   const [autoScroll, setAutoScroll] = useState(true);
   const [newCount, setNewCount] = useState(0);
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
@@ -106,6 +110,7 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
     return data.entries.filter((entry) => {
       if (levelFilter.size > 0 && !levelFilter.has(entry.levelLabel)) return false;
       if (tagFilter !== "all" && entry.tag !== tagFilter) return false;
+      if (serviceFilter !== "all" && (entry.service || "addon") !== serviceFilter) return false;
       if (debouncedSearch) {
         const q = debouncedSearch.toLowerCase();
         if (!entry.message.toLowerCase().includes(q)
@@ -115,7 +120,19 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
       }
       return true;
     });
-  }, [data?.entries, levelFilter, tagFilter, debouncedSearch]);
+  }, [data?.entries, levelFilter, tagFilter, serviceFilter, debouncedSearch]);
+
+  // Only a single level can go to the buffer, so a multi-level pick stays local
+  // and the stream stays unfiltered on that axis.
+  useEffect(() => {
+    if (!onFiltersChange) return;
+    onFiltersChange({
+      level: levelFilter.size === 1 ? Array.from(levelFilter)[0] : undefined,
+      tag: tagFilter !== "all" ? tagFilter : undefined,
+      service: serviceFilter !== "all" ? serviceFilter : undefined,
+      search: debouncedSearch || undefined,
+    });
+  }, [levelFilter, tagFilter, serviceFilter, debouncedSearch, onFiltersChange]);
 
   const virtualizer = useVirtualizer({
     count: filteredEntries.length,
@@ -145,6 +162,31 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
     prevLenRef.current = len;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEntryId, autoScroll]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const breakOut = () => setAutoScroll((prev) => (prev ? false : prev));
+    const onWheel = (e: WheelEvent) => { if (e.deltaY < 0) breakOut(); };
+    let touchStartY = 0;
+    const onTouchStart = (e: TouchEvent) => { touchStartY = e.touches[0]?.clientY ?? 0; };
+    const onTouchMove = (e: TouchEvent) => {
+      if ((e.touches[0]?.clientY ?? 0) - touchStartY > 10) breakOut();
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") breakOut();
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
 
   const handleScroll = () => {
     if (!scrollRef.current || isAutoScrolling.current) return;
@@ -183,6 +225,7 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
     setDebouncedSearch("");
     setLevelFilter(new Set());
     setTagFilter("all");
+    setServiceFilter("all");
   };
 
   const copyRow = useCallback((entry: LogEntry) => {
@@ -219,8 +262,9 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
     prevLenRef.current = 0;
   };
 
-  const hasFilters = search || levelFilter.size > 0 || tagFilter !== "all";
+  const hasFilters = search || levelFilter.size > 0 || tagFilter !== "all" || serviceFilter !== "all";
   const tags = data?.tags || [];
+  const services = data?.services || [];
 
   if (loading) {
     return (
@@ -343,13 +387,26 @@ export function DashboardLogs({ data, loading, paused = false, onPauseToggle, on
                 ))}
               </SelectContent>
             </Select>
+            <Select value={serviceFilter} onValueChange={setServiceFilter}>
+              <SelectTrigger className="w-[150px] h-9">
+                <SelectValue placeholder="Service" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Services</SelectItem>
+                {/* Keep the active filter listed even if it has aged out of the buffer. */}
+                {Array.from(new Set(serviceFilter === 'all' ? services : [...services, serviceFilter])).map((s) => (
+                  <SelectItem key={s} value={s}>{s}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="relative">
           <div
             ref={scrollRef}
             onScroll={handleScroll}
-            className="h-[600px] overflow-y-auto rounded-md border bg-[hsl(240_6%_7%)] font-mono text-[13px] leading-relaxed"
+            tabIndex={0}
+            className="h-[600px] overflow-y-auto rounded-md border bg-[hsl(240_6%_7%)] font-mono text-[13px] leading-relaxed focus:outline-none"
           >
             {filteredEntries.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
@@ -454,6 +511,11 @@ const LogRow = React.memo(function LogRow({
       <Badge variant="outline" className={`shrink-0 text-[10px] px-1.5 py-0 font-medium uppercase ${levelClass}`}>
         {entry.levelLabel}
       </Badge>
+      {entry.service && entry.service !== "addon" && (
+        <Badge variant="outline" className="shrink-0 text-[10px] px-1.5 py-0 font-normal text-cyan-400/80 border-cyan-400/20">
+          {entry.service}
+        </Badge>
+      )}
       {entry.tag && (
         <Badge variant="outline" className="shrink-0 text-[10px] px-1.5 py-0 font-normal text-muted-foreground border-muted-foreground/20">
           {entry.tag}

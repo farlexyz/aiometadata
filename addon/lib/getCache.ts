@@ -1,9 +1,9 @@
-const buildInfo: any = require('./buildInfo');
 const redis: any = require('./redisClient');
 const { loadConfigFromDatabase }: any = require('./configApi');
 const consola: any = require('consola');
 const crypto: any = require('crypto');
 const { isMetricsDisabled }: any = require('./metricsConfig');
+const { allowsUnrated, hasAgeRatingCap }: any = require('../utils/ageRating');
 const {
   decodeCachePayload,
   encodeCachePayload,
@@ -13,10 +13,18 @@ const {
   applyLinksUserScopeProjection,
 }: any = require('./linkProjection');
 const {
+  applyImdbRatingProjection,
+  applyImdbRatingProjectionToList,
+}: any = require('./imdbRatingProjection');
+const {
   RELEASE_AVAILABILITY_FIELD,
   normalizeMetaReleaseAvailability,
   normalizeReleaseAvailabilityInPayload,
 }: any = require('../utils/releaseAvailability');
+const {
+  normalizeMetaCredits,
+  normalizeCreditsInPayload,
+}: any = require('../utils/metaCredits');
 
 function hashConfig(configObj: any): string {
   const str = typeof configObj === 'string' ? configObj : stableStringify(configObj);
@@ -37,11 +45,20 @@ function parsePositiveIntEnv(envValue: any, defaultValue: number, minValue: numb
 }
 
 
-const ADDON_VERSION = buildInfo.version;
+const { withEpoch, withGlobalEpoch }: any = require('./cacheEpoch');
+const { clampTtlToWarmWindow }: any = require('./catalogWarmWindow');
+const { clampMetaTtlToAirWindow }: any = require('./metaAirWindow');
+const {
+  isRefreshAheadEnabled,
+  isDueForRefresh,
+  mayReplaceOnRefresh,
+  runRefreshAhead,
+  getRefreshAheadStats,
+  resetRefreshAheadStats,
+}: any = require('./cacheRefreshAhead');
 
 function META_TTL() { return parseInt(process.env.META_TTL || String(7 * 24 * 60 * 60), 10); }
 function CATALOG_TTL() { return parseInt(process.env.CATALOG_TTL || String(1 * 24 * 60 * 60), 10); }
-function TMDB_TRENDING_TTL() { return parseInt(process.env.TMDB_TRENDING_TTL || String(3 * 60 * 60), 10); }
 const JIKAN_API_TTL = 30 * 24 * 60 * 60;
 const STATIC_CATALOG_TTL = 30 * 24 * 60 * 60;
 const TVDB_API_TTL = 12 * 60 * 60;
@@ -66,6 +83,9 @@ const cacheHealth: any = {
   errors: 0,
   cachedErrors: 0,
   corruptedEntries: 0,
+  coldStoreHits: 0,
+  coldStoreMisses: 0,
+  coldStoreComponents: 0,
   lastHealthCheck: Date.now(),
   errorCounts: {},
   keyAccessCounts: new Map(),
@@ -363,6 +383,18 @@ async function attemptSelfHealing(key: string, originalError: any): Promise<bool
   }
 }
 
+function contentTypeForKey(key: string): string {
+  if (key.startsWith('meta')) return 'meta';
+  if (key.startsWith('catalog')) return 'catalog';
+  if (key.startsWith('search')) return 'search';
+  if (key.startsWith('genre')) return 'genre';
+  return 'unknown';
+}
+
+function wasCachedAtNominalTtl(classifier: any, value: any, key: string): boolean {
+  return classifier(value, null, key).ttl === null;
+}
+
 function classifyResult(result: any, error: any = null, cacheKey: string | null = null): { type: string; ttl: number | null } {
   if (error) {
     const errorMessage = error.message?.toLowerCase() || '';
@@ -384,6 +416,10 @@ function classifyResult(result: any, error: any = null, cacheKey: string | null 
     return { type: 'EMPTY_RESULT', ttl: ERROR_TTL_STRATEGIES.EMPTY_RESULT };
   }
 
+  if ((result as any)?.meta?.__degradedFallback) {
+    return { type: 'DEGRADED_FALLBACK', ttl: 0 };
+  }
+
   const isExternalApi = cacheKey && (
     cacheKey.includes('tvdb-api:') ||
     cacheKey.includes('tmdb-api:') ||
@@ -401,7 +437,8 @@ function classifyResult(result: any, error: any = null, cacheKey: string | null 
     cacheKey.includes('mdblist_') ||
     cacheKey.includes('stremthru-') ||
     cacheKey.includes('cinemeta-') ||
-    cacheKey.includes('flixpatrol-')
+    cacheKey.includes('flixpatrol-') ||
+    cacheKey.includes('movielens-')
   );
 
   if (isExternalApi) {
@@ -441,13 +478,18 @@ function classifyResult(result: any, error: any = null, cacheKey: string | null 
   return { type: 'EMPTY_RESULT', ttl: ERROR_TTL_STRATEGIES.EMPTY_RESULT };
 }
 
+function classifyResultAllowEmpty(result: any, error: any = null, cacheKey: string | null = null): { type: string; ttl: number | null } {
+  const base = classifyResult(result, error, cacheKey);
+  return base.type === 'EMPTY_RESULT' ? { type: 'SUCCESS', ttl: null } : base;
+}
+
 async function cacheWrap(key: string, method: () => Promise<any>, ttl: number, options: any = {}): Promise<any> {
   if (!redis) {
     return method();
   }
 
-  const versionedKey = `v${ADDON_VERSION}:${key}`;
-  return singleFlight(versionedKey, () => cacheWrapInternal(key, method, ttl, options, versionedKey));
+  const epochKey = withEpoch(key);
+  return singleFlight(epochKey, () => cacheWrapInternal(key, method, ttl, options, epochKey));
 }
 
 async function cacheWrapInternal(key: string, method: () => Promise<any>, ttl: number, options: any, versionedKey: string): Promise<any> {
@@ -456,13 +498,18 @@ async function cacheWrapInternal(key: string, method: () => Promise<any>, ttl: n
     resultClassifier = classifyResult,
     maxRetries = SELF_HEALING_CONFIG.maxRetries,
     onHit,
+    refreshAhead = false,
   } = options;
+
+  const wantsRefreshAhead = refreshAhead === true && isRefreshAheadEnabled();
 
   let retries = 0;
 
   while (retries <= maxRetries) {
   try {
-    const cached = await redis.getBuffer(versionedKey);
+    const [cached, pttlMs] = wantsRefreshAhead
+      ? await Promise.all([redis.getBuffer(versionedKey), redis.pttl(versionedKey)])
+      : [await redis.getBuffer(versionedKey), -1];
     if (cached) {
         try {
           const parsed = await decodeCachePayload(cached);
@@ -491,6 +538,25 @@ async function cacheWrapInternal(key: string, method: () => Promise<any>, ttl: n
               }
             }
             updateCacheHealth(versionedKey, 'hit', true);
+
+            if (wantsRefreshAhead) {
+              try {
+                if (isDueForRefresh(pttlMs, ttl) && wasCachedAtNominalTtl(resultClassifier, parsed, key)) {
+                  runRefreshAhead(versionedKey, async () => {
+                    const fresh = await method();
+                    if (fresh === null || fresh === undefined) return false;
+                    if (resultClassifier(fresh, null, key).type !== 'SUCCESS') return false;
+                    if (!mayReplaceOnRefresh(parsed, fresh)) return false;
+                    if (!cacheValidator.validateBeforeCache(fresh, contentTypeForKey(key)).isValid) return false;
+                    const written = await redis.set(versionedKey, await encodeCachePayload(fresh), 'EX', ttl, 'XX');
+                    return Boolean(written);
+                  }, pttlMs).catch(() => {});
+                }
+              } catch (refreshError: any) {
+                cacheLogger.warn(`[Cache] Refresh-ahead check failed for ${versionedKey}:`, refreshError);
+              }
+            }
+
             return parsed;
           }
         } catch (parseError: any) {
@@ -508,16 +574,7 @@ async function cacheWrapInternal(key: string, method: () => Promise<any>, ttl: n
       updateCacheHealth(versionedKey, 'miss', true);
 
     if (result !== null && result !== undefined) {
-        let contentType = 'unknown';
-        if (key.startsWith('meta')) {
-          contentType = 'meta';
-        } else if (key.startsWith('catalog')) {
-          contentType = 'catalog';
-        } else if (key.startsWith('search')) {
-          contentType = 'search';
-        } else if (key.startsWith('genre')) {
-          contentType = 'genre';
-        }
+        const contentType = contentTypeForKey(key);
         const validation = cacheValidator.validateBeforeCache(result, contentType);
 
         if (!validation.isValid) {
@@ -590,9 +647,9 @@ async function cacheWrapGlobal(key: string, method: () => Promise<any>, ttl: num
     return method();
   }
 
-  const { skipVersion = false } = options;
-  const versionedKey = skipVersion ? `global:${key}` : `global:${ADDON_VERSION}:${key}`;
-  return singleFlight(versionedKey, () => cacheWrapGlobalInternal(key, method, ttl, options, versionedKey));
+  const { upstream = false } = options;
+  const epochKey = upstream ? `global:${key}` : withGlobalEpoch(key);
+  return singleFlight(epochKey, () => cacheWrapGlobalInternal(key, method, ttl, options, epochKey));
 }
 
 async function cacheWrapGlobalInternal(key: string, method: () => Promise<any>, ttl: number, options: any, versionedKey: string): Promise<any> {
@@ -714,6 +771,10 @@ function getCatalogContentScope(idOnly: string, catalogType: string, config: any
   }
 
   if (idOnly === 'simkl.calendar') return 'mixed';
+  if (idOnly === 'simkl.upnext.anime') return 'anime';
+  // Mixed, not series: the row can carry anime too, so the anime providers have to
+  // reach the config hash or a provider change would serve stale episode numbers.
+  if (idOnly === 'simkl.upnext') return 'mixed';
 
   if (idOnly === 'mdblist.upnext') return 'series';
   if (idOnly === 'mdblist.watchlist') return 'mixed';
@@ -759,6 +820,26 @@ function buildScopedProviderConfig(config: any, contentScope: string): any {
   artProviders.originalLangFallback = config.artProviders?.originalLangFallback;
 
   return { providers, artProviders };
+}
+
+/**
+ * With the detection override on, a tmdb or imdb id can still be built by the anime
+ * provider, so the anime half of the config decides the result and has to reach the
+ * hash. It is left out when the override is off, so those keys stay where they are.
+ */
+function animeOverrideKeyParts(config: any): any {
+  if (!config.providers?.forceAnimeForDetectedImdb) return {};
+  return {
+    anime: {
+      provider: config.providers?.anime || 'mal',
+      useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false,
+      art: {
+        poster: resolveArtProvider('anime', 'poster', config),
+        background: resolveArtProvider('anime', 'background', config),
+        logo: resolveArtProvider('anime', 'logo', config),
+      },
+    },
+  };
 }
 
 function getMetaCacheContext(config: any, metaId: string, type: string | null, useShowPoster: boolean = false): any {
@@ -817,6 +898,7 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
         scrapeImdb: config.tmdb?.scrapeImdb || false,
         forceLatinCastNames: config.tmdb?.forceLatinCastNames || false,
       },
+      ...animeOverrideKeyParts(config),
     };
   } else if (type === 'series') {
     context.metaProvider = config.providers?.series || 'tvdb';
@@ -831,11 +913,28 @@ function getMetaCacheContext(config: any, metaId: string, type: string | null, u
         forceLatinCastNames: config.tmdb?.forceLatinCastNames || false,
       },
       forceAnimeForDetectedImdb: config.providers?.forceAnimeForDetectedImdb || false,
+      ...animeOverrideKeyParts(config),
     };
     context.videoOptions = {
       tvdbSeasonType: config.tvdbSeasonType || 'default',
       forceAnimeForDetectedImdb: config.providers?.forceAnimeForDetectedImdb || false,
+      ...(config.providers?.forceAnimeForDetectedImdb
+        ? {
+            mal: {
+              skipFiller: config.mal?.skipFiller || false,
+              skipRecap: config.mal?.skipRecap || false,
+              allowEpisodeMarking: config.mal?.allowEpisodeMarking || false,
+            },
+          }
+        : {}),
     };
+  }
+
+  // A cap named by the install URL changes which providers a meta is built from, so it
+  // cannot share a key with the same title built without one. Only set when a URL asks
+  // for it, which leaves every existing key where it is.
+  if (config._ratingOverride) {
+    context.providerOptions = { ...context.providerOptions, ratingOverride: config._ratingOverride };
   }
 
   return context;
@@ -856,15 +955,39 @@ function getMetaSmartLockContextHash(config: any, metaId: string, type: string |
   });
 }
 
-function buildMetaComponentCacheKeys({ config, metaId, type, useShowPoster = false }: { config: any; metaId: string; type: string | null; useShowPoster?: boolean }): Record<string, string> {
-  const ctx = getMetaCacheContext(config, metaId, type, useShowPoster);
-  const commonProvider = {
+function metaIdentityProfile(ctx: any, config: any): any {
+  return {
     ...ctx.base,
     metaProvider: ctx.metaProvider,
     animeIdProvider: ctx.animeIdProvider,
     providerOptions: ctx.providerOptions,
     showMetaProviderAttribution: config.showMetaProviderAttribution || false,
   };
+}
+
+/**
+ * Components are keyed by the id a meta resolved to, while later reads ask by the
+ * id they started from. The alias records that hop.
+ *
+ * The hash carries idResolution because the anime path leaves
+ * useImdbIdForCatalogAndSearch out of the identity profile. It stays out of the
+ * component keys, where moving commonHash would orphan every stored component.
+ */
+function buildMetaAliasCacheKey({ config, metaId, type, useShowPoster = false }: { config: any; metaId: string; type: string | null; useShowPoster?: boolean }): string {
+  const ctx = getMetaCacheContext(config, metaId, type, useShowPoster);
+  const profile = {
+    ...metaIdentityProfile(ctx, config),
+    idResolution: {
+      useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false,
+      forceAnimeForDetectedImdb: config.providers?.forceAnimeForDetectedImdb || false,
+    },
+  };
+  return `meta-alias:${hashProfile(profile)}:${metaId}`;
+}
+
+function buildMetaComponentCacheKeys({ config, metaId, type, useShowPoster = false }: { config: any; metaId: string; type: string | null; useShowPoster?: boolean }): Record<string, string> {
+  const ctx = getMetaCacheContext(config, metaId, type, useShowPoster);
+  const commonProvider = metaIdentityProfile(ctx, config);
   const artCommon = {
     ...ctx.base,
     metaProvider: ctx.metaProvider,
@@ -872,53 +995,39 @@ function buildMetaComponentCacheKeys({ config, metaId, type, useShowPoster = fal
     providerOptions: ctx.providerOptions,
   };
 
-  const basicProfile = {
-    ...commonProvider,
-  };
-  const posterProfile = {
+  const commonHash = hashProfile(commonProvider);
+  const posterHash = hashProfile({
     ...artCommon,
     artProvider: ctx.artProvider.poster,
     useShowPosterForUpNext: !!ctx.useShowPoster,
-  };
-  const backgroundProfile = {
+  });
+  const backgroundHash = hashProfile({
     ...artCommon,
     artProvider: ctx.artProvider.background,
-  };
-  const logoProfile = {
+  });
+  const logoHash = hashProfile({
     ...artCommon,
     artProvider: ctx.artProvider.logo,
-  };
-  const videosProfile = {
+  });
+  const videosHash = hashProfile({
     ...commonProvider,
     videoOptions: ctx.videoOptions,
-  };
-  const creditsProfile = {
-    ...commonProvider,
-  };
-  const linksProfile = {
-    ...commonProvider,
-  };
-  const trailersProfile = {
-    ...commonProvider,
-  };
-  const extrasProfile = {
-    ...commonProvider,
-  };
+  });
 
   return {
-    basic: `meta-basic:${hashProfile(basicProfile)}:${metaId}`,
-    poster: `meta-poster:${hashProfile(posterProfile)}:${metaId}`,
-    rawPoster: `meta-raw-poster:${hashProfile(posterProfile)}:${metaId}`,
-    background: `meta-background:${hashProfile(backgroundProfile)}:${metaId}`,
-    landscapePoster: `meta-landscape-poster:${hashProfile(backgroundProfile)}:${metaId}`,
-    logo: `meta-logo:${hashProfile(logoProfile)}:${metaId}`,
-    videos: `meta-videos:${hashProfile(videosProfile)}:${metaId}`,
-    cast: `meta-cast:${hashProfile(creditsProfile)}:${metaId}`,
-    director: `meta-director:${hashProfile(creditsProfile)}:${metaId}`,
-    writer: `meta-writer:${hashProfile(creditsProfile)}:${metaId}`,
-    links: `meta-links:${hashProfile(linksProfile)}:${metaId}`,
-    trailers: `meta-trailers:${hashProfile(trailersProfile)}:${metaId}`,
-    extras: `meta-extras:${hashProfile(extrasProfile)}:${metaId}`,
+    basic: `meta-basic:${commonHash}:${metaId}`,
+    poster: `meta-poster:${posterHash}:${metaId}`,
+    rawPoster: `meta-raw-poster:${posterHash}:${metaId}`,
+    background: `meta-background:${backgroundHash}:${metaId}`,
+    landscapePoster: `meta-landscape-poster:${backgroundHash}:${metaId}`,
+    logo: `meta-logo:${logoHash}:${metaId}`,
+    videos: `meta-videos:${videosHash}:${metaId}`,
+    cast: `meta-cast:${commonHash}:${metaId}`,
+    director: `meta-director:${commonHash}:${metaId}`,
+    writer: `meta-writer:${commonHash}:${metaId}`,
+    links: `meta-links:${commonHash}:${metaId}`,
+    trailers: `meta-trailers:${commonHash}:${metaId}`,
+    extras: `meta-extras:${commonHash}:${metaId}`,
   };
 }
 
@@ -1031,12 +1140,29 @@ function applyCastCountProjection(meta: any, config: any): any {
   return meta;
 }
 
-function projectMetaForUser(meta: any, config: any): any {
+/**
+ * Clients play a trailer from trailerStreams, and the field is a restatement of
+ * trailers, so it is derived here rather than stored. That keeps the two from
+ * drifting and keeps the cached component's shape unchanged.
+ */
+function applyTrailerStreamsProjection(meta: any): any {
+  if (!Array.isArray(meta?.trailers) || meta.trailers.length === 0) return meta;
+  if (Array.isArray(meta.trailerStreams) && meta.trailerStreams.length > 0) return meta;
+  meta.trailerStreams = meta.trailers
+    .filter((trailer: any) => trailer?.source)
+    .map((trailer: any) => ({ title: trailer.name || 'Trailer', ytId: trailer.source }));
+  return meta;
+}
+
+async function projectMetaForUser(meta: any, config: any): Promise<any> {
   if (!meta) return meta;
+  normalizeMetaCredits(meta);
+  applyTrailerStreamsProjection(meta);
   applyCastCountProjection(meta, config);
   applyBlurThumbProjection(meta, config);
   applyDisplayAgeRatingProjection(meta, config);
   applyLinksUserScopeProjection(meta, config);
+  await applyImdbRatingProjection(meta);
   return meta;
 }
 
@@ -1088,6 +1214,10 @@ function projectAppExtrasForCatalogCache(appExtras: any): any {
   const projected: any = {};
   const fields = [
     'certification',
+    // The catalog renders this in preference to `certification` when it is set, so
+    // dropping it made a cached row fall back to the US rating while the meta page
+    // kept showing the user's own. Same title, two answers, on a cache hit only.
+    'certificationLocal',
     'ratings',
     'releaseAvailability',
     'cast',
@@ -1188,9 +1318,6 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
 
   const idOnly = catalogKey.split(':')[0];
   const catalogType = catalogKey.split(':')[1];
-  const trendingIds = new Set(['tmdb.trending']);
-  const isTrendingCatalog = trendingIds.has(idOnly);
-
   const isAuthCatalog = idOnly === 'tmdb.watchlist' || idOnly === 'tmdb.favorites';
 
   const isAiringTodayCatalog = idOnly === 'tmdb.airing_today';
@@ -1223,13 +1350,14 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     sfw: config.sfw || false,
     includeAdult: config.includeAdult || false,
     ageRating: config.ageRating || null,
+    ...(hasAgeRatingCap(config) ? { allowUnratedContent: allowsUnrated(config) } : {}),
     showMetaProviderAttribution: config.showMetaProviderAttribution || false,
   };
 
-  const isMDBListWatchlistOrUpNext = idOnly.startsWith('mdblist.watchlist') || idOnly === 'mdblist.upnext';
+  const isMDBListWatchlistOrUpNext = idOnly.startsWith('mdblist.watchlist') || idOnly === 'mdblist.upnext' || idOnly.startsWith('mdblist.recommended.');
   if (isMDBListCatalog && isMDBListWatchlistOrUpNext) {
     catalogConfig.apiKeys = {
-      mdblist: config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || ''
+      mdblist: config.apiKeys?.mdblist || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || ''
     };
   }
 
@@ -1242,7 +1370,7 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     };
   }
 
-  if (idOnly.startsWith('simkl.watchlist.')) {
+  if (idOnly.startsWith('simkl.watchlist.') || idOnly.startsWith('simkl.upnext')) {
     catalogConfig.apiKeys = {
       simklTokenId: config.apiKeys?.simklTokenId || ''
     };
@@ -1255,7 +1383,21 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     };
   }
 
-  if (isMALCatalog || contentScope === 'anime') {
+  if (idOnly.startsWith('mal.userlist.') || idOnly === 'mal.suggestions') {
+    catalogConfig.apiKeys = {
+      malTokenId: config.apiKeys?.malTokenId || ''
+    };
+  }
+
+  if (idOnly.startsWith('movielens.')) {
+    catalogConfig.apiKeys = {
+      movieLensCredId: config.apiKeys?.movieLensCredId || ''
+    };
+  }
+
+  // Non-anime scopes need it too once the detection override is on, since it then
+  // decides the id of every anime the row happens to carry.
+  if (isMALCatalog || contentScope === 'anime' || config.providers?.forceAnimeForDetectedImdb) {
     catalogConfig.mal = {
       useImdbIdForCatalogAndSearch: config.mal?.useImdbIdForCatalogAndSearch || false
     };
@@ -1269,13 +1411,11 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
   const configHash = hashConfig(catalogConfigString);
 
   let cacheTTL = CATALOG_TTL();
+  let cachingDisabled = false;
 
   if (isAuthCatalog) {
     cacheTTL = 0;
     cacheLogger.debug(`[Catalog] Not caching auth catalog ${idOnly} (user-specific data changes frequently)`);
-  } else if (isTrendingCatalog) {
-    cacheTTL = TMDB_TRENDING_TTL();
-    cacheLogger.debug(`[Catalog] Using TMDB trending cache TTL for ${idOnly}: ${cacheTTL}s`);
   }
 
   const decadeCatalogs = ['mal.80sDecade', 'mal.90sDecade', 'mal.00sDecade', 'mal.10sDecade'];
@@ -1284,73 +1424,36 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
     cacheLogger.debug(`[Catalog] Using extended cache TTL for decade catalog ${idOnly}: 30 days`);
   }
 
-  if (idOnly.startsWith('mdblist.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for MDBList catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
+  // One override chain for every source that lets a catalog carry its own TTL. A
+  // catalog with no `cacheTTL` follows CATALOG_TTL, so moving the instance default
+  // reaches it; 0 means the caller asked for no caching at all.
+  const ttlOverrideSources: Array<{ label: string; matches: boolean; min?: number; floorDefault?: boolean }> = [
+    { label: 'MDBList', matches: idOnly.startsWith('mdblist.') },
+    { label: 'Trakt', matches: idOnly.startsWith('trakt.') },
+    { label: 'MAL user list', matches: idOnly.startsWith('mal.userlist.') || idOnly === 'mal.suggestions' },
+    { label: 'Simkl trending', matches: idOnly.startsWith('simkl.trending.') || idOnly.startsWith('simkl.recipe.'), min: 3600, floorDefault: true },
+    { label: 'Simkl watchlist', matches: idOnly.startsWith('simkl.watchlist.') || idOnly.startsWith('simkl.upnext') },
+    { label: 'Letterboxd', matches: idOnly.startsWith('letterboxd.') },
+    { label: 'custom manifest', matches: idOnly.startsWith('custom.') },
+    { label: 'AniList', matches: idOnly.startsWith('anilist.') },
+    { label: 'PublicMetaDB', matches: idOnly.startsWith('publicmetadb.') },
+    { label: 'SimKL', matches: idOnly.startsWith('simkl.') },
+    { label: 'discover', matches: isDiscoverCatalog },
+  ];
 
-  if (idOnly.startsWith('trakt.')) {
+  const ttlSource = ttlOverrideSources.find(source => source.matches);
+  if (ttlSource) {
     const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for Trakt catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (idOnly.startsWith('simkl.trending.') || idOnly.startsWith('simkl.recipe.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    cacheTTL = Math.max(catCfg?.cacheTTL || CATALOG_TTL(), 3600);
-    cacheLogger.debug(`[Catalog] Using cache TTL for Simkl catalog ${idOnly}: ${cacheTTL}s`);
-  }
-
-  if (idOnly.startsWith('simkl.watchlist.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for Simkl watchlist catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (idOnly.startsWith('letterboxd.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for Letterboxd catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (idOnly.startsWith('custom.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for custom manifest catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (idOnly.startsWith('anilist.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for AniList catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (idOnly.startsWith('simkl.')) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for SimKL catalog ${idOnly}: ${cacheTTL}s`);
-    }
-  }
-
-  if (isDiscoverCatalog) {
-    const catCfg = config.catalogs?.find((c: any) => c.id === idOnly);
-    if (catCfg?.cacheTTL) {
-      cacheTTL = catCfg.cacheTTL;
-      cacheLogger.debug(`[Catalog] Using custom cache TTL for discover catalog ${idOnly}: ${cacheTTL}s`);
+    const override = Number.isFinite(catCfg?.cacheTTL) && catCfg.cacheTTL >= 0 ? catCfg.cacheTTL : undefined;
+    if (override !== undefined) {
+      cacheTTL = ttlSource.min ? Math.max(override, ttlSource.min) : override;
+      cachingDisabled = cacheTTL === 0;
+      cacheLogger.debug(cachingDisabled
+        ? `[Catalog] Caching disabled for ${ttlSource.label} catalog ${idOnly}`
+        : `[Catalog] Using custom cache TTL for ${ttlSource.label} catalog ${idOnly}: ${cacheTTL}s`);
+    } else if (ttlSource.floorDefault && ttlSource.min) {
+      cacheTTL = Math.max(cacheTTL, ttlSource.min);
+      cacheLogger.debug(`[Catalog] Using cache TTL for ${ttlSource.label} catalog ${idOnly}: ${cacheTTL}s`);
     }
   }
 
@@ -1392,9 +1495,13 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       },
     };
   }
+  if (idOnly.startsWith('movielens.')) {
+    options = { ...options, resultClassifier: classifyResultAllowEmpty };
+  }
   const existingOnHit = options.onHit;
   options = {
     ...options,
+    refreshAhead: !isAiringTodayCatalog,
     onHit: (hit: any) => {
       if (typeof existingOnHit === 'function') {
         existingOnHit(hit);
@@ -1402,10 +1509,20 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       cacheLogger.debug(`[Catalog] HIT detail (${idOnly}) [sig:${catalogSig}] catalogConfig:${catalogConfigString} catalogKey:${catalogKey}`);
     },
   };
-  const result = await cacheWrap(key, async () => {
-    return normalizeReleaseAvailabilityInPayload(await method());
-  }, cacheTTL, options);
+  // The key keeps the configured TTL so it stays stable across runs; only the
+  // lifetime written to Redis is held inside the warm window.
+  const writeTTL = cachingDisabled ? cacheTTL : await clampTtlToWarmWindow(userUUID, cacheTTL);
+  if (writeTTL !== cacheTTL) {
+    cacheLogger.debug(`[Catalog] Holding ${idOnly} to ${writeTTL}s so it lapses before the next warm run (configured ${cacheTTL}s)`);
+  }
+
+  const result = cachingDisabled
+    ? normalizeReleaseAvailabilityInPayload(await method())
+    : await cacheWrap(key, async () => {
+        return normalizeReleaseAvailabilityInPayload(await method());
+      }, writeTTL, options);
   normalizeReleaseAvailabilityInPayload(result);
+  normalizeCreditsInPayload(result);
 
   if (result?.metas?.length) {
     const displayAgeRating = config.displayAgeRating || false;
@@ -1426,6 +1543,8 @@ async function cacheWrapCatalog(userUUID: string, catalogKey: string, method: ()
       }
     }
   }
+
+  await applyImdbRatingProjectionToList(result?.metas);
 
   return result;
   }
@@ -1467,6 +1586,7 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
     sfw: config.sfw || false,
     includeAdult: config.includeAdult || false,
     ageRating: config.ageRating || null,
+    ...(hasAgeRatingCap(config) ? { allowUnratedContent: allowsUnrated(config) } : {}),
     metaProviders: config.providers || {},
     artProviders: config.artProviders || {},
     blurThumbs: config.blurThumbs || false,
@@ -1478,6 +1598,7 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
     aiProvider: config.search?.ai_provider || 'gemini',
     aiModel: config.search?.ai_model || '',
     aiWebSearch: config.search?.ai_web_search || false,
+    aiOpenrouterWebSearch: config.search?.ai_openrouter_web_search !== false,
   };
 
   const searchConfigString = JSON.stringify(searchConfig);
@@ -1492,6 +1613,7 @@ async function cacheWrapSearch(userUUID: string, searchKey: string, method: () =
     return normalizeReleaseAvailabilityInPayload(await method());
   }, SEARCH_TTL, options);
   normalizeReleaseAvailabilityInPayload(result);
+  await applyImdbRatingProjectionToList(result?.metas);
   return result;
 }
 
@@ -1635,14 +1757,6 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
     cacheLogger.warn(`Failed to capture metadata for dashboard: ${error.message}`);
   }
 
-  if (meta.imdb_id && (meta.imdbRating == null || meta.imdbRating === 'N/A')) {
-    const imdbRatings = require('./imdbRatings');
-    if (!(await imdbRatings.ratingsAvailable())) {
-      cacheLogger.debug(`[Meta] Not caching ${metaId}: IMDb rating unavailable (ratings dataset not loaded yet)`);
-      return { meta: projectMetaForUser(meta, config) };
-    }
-  }
-
    const componentsToCache: any[] = [];
 
    const basicMeta: any = {
@@ -1676,7 +1790,8 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
       _hasLandscapePoster: !!meta.landscapePoster,
       _hasLogo: !!meta.logo,
       _hasVideos: !!(meta.videos && Array.isArray(meta.videos) && meta.videos.length > 0),
-      _hasLinks: !!(meta.links && Array.isArray(meta.links) && meta.links.length > 0)
+      _hasLinks: !!(meta.links && Array.isArray(meta.links) && meta.links.length > 0),
+      _metaProvider: meta._metaProvider
    };
 
    queueComponentCache(componentsToCache, componentCacheKeys.basic, basicMeta);
@@ -1716,7 +1831,7 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
    }
 
    if (meta.videos && Array.isArray(meta.videos) && meta.videos.length > 0) {
-     queueComponentCache(componentsToCache, componentCacheKeys.videos, { videos: canonicalizeVideosForCache(meta.videos) });
+     queueComponentCache(componentsToCache, componentCacheKeys.videos, { videos: canonicalizeVideosForCache(meta.videos), _metaProvider: meta._metaProvider });
    }
 
    if (meta.app_extras?.cast?.length) {
@@ -1744,8 +1859,23 @@ async function writeMetaComponentsWithConfig({ config, metaId, result, ttl = MET
      queueComponentCache(componentsToCache, componentCacheKeys.extras, { app_extras: extrasForCache });
    }
 
-  await cacheComponentsPipeline(componentsToCache, ttl, { overwrite });
-   return { meta: projectMetaForUser(meta, config) };
+  const airWindowTtl = clampMetaTtlToAirWindow(meta, ttl);
+  if (airWindowTtl !== ttl) {
+    cacheLogger.debug(`[Meta] Holding ${metaId} to ${airWindowTtl}s so it lapses after the next episode airs (base ${ttl}s)`);
+  }
+
+  await cacheComponentsPipeline(componentsToCache, airWindowTtl, { overwrite });
+
+  try {
+    const coldStore = require('./metaColdStore');
+    if (coldStore.isEnabled()) {
+      coldStore.writeThrough(meta, componentsToCache);
+    }
+  } catch (coldErr: any) {
+    cacheLogger.warn(`[ColdStore] write-through failed for ${metaId}: ${coldErr?.message}`);
+  }
+
+   return { meta: await projectMetaForUser(meta, config) };
 }
 
 async function writeMetaComponentsBatchWithConfig({ config, metas, ttl = META_TTL(), type = null, useShowPoster = false, overwrite = true }: { config: any; metas: any[]; ttl?: number; type?: string | null; useShowPoster?: boolean; overwrite?: boolean }): Promise<{ written: number; skipped: number }> {
@@ -1782,6 +1912,26 @@ async function writeMetaComponentsBatchWithConfig({ config, metas, ttl = META_TT
   return { written, skipped };
 }
 
+async function readMetaAlias({ config, metaId, type = null, useShowPoster = false }: { config: any; metaId: string; type?: string | null; useShowPoster?: boolean }): Promise<string | null> {
+  if (!redis) return null;
+  try {
+    const aliased = await redis.get(withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster })));
+    return typeof aliased === 'string' && aliased ? aliased : null;
+  } catch (error: any) {
+    cacheLogger.warn(`[Meta] Alias read failed for ${metaId}: ${error?.message}`);
+    return null;
+  }
+}
+
+async function writeMetaAlias({ config, metaId, aliasTo, ttl = META_TTL(), type = null, useShowPoster = false }: { config: any; metaId: string; aliasTo: string; ttl?: number; type?: string | null; useShowPoster?: boolean }): Promise<void> {
+  if (!redis || !metaId || !aliasTo || metaId === aliasTo) return;
+  try {
+    await redis.set(withEpoch(buildMetaAliasCacheKey({ config, metaId, type, useShowPoster })), aliasTo, 'EX', ttl);
+  } catch (error: any) {
+    cacheLogger.warn(`[Meta] Alias write failed for ${metaId} -> ${aliasTo}: ${error?.message}`);
+  }
+}
+
 async function reconstructMetaFromComponents(userUUID: string, metaId: string, ttl: number = META_TTL(), options: any = {}, type: string | null = null, includeVideos: boolean = true, useShowPoster: boolean = false): Promise<any> {
    if (!metaId || typeof metaId !== 'string') {
      cacheLogger.warn(`Invalid metaId provided: ${metaId}`);
@@ -1810,7 +1960,7 @@ async function reconstructMetaFromComponents(userUUID: string, metaId: string, t
   });
 }
 
-async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = null, includeVideos = true, useShowPoster = false }: { config: any; metaId: string; type?: string | null; includeVideos?: boolean; useShowPoster?: boolean }): Promise<any> {
+async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = null, includeVideos = true, useShowPoster = false, countColdStoreMiss = true, followAlias = true }: { config: any; metaId: string; type?: string | null; includeVideos?: boolean; useShowPoster?: boolean; countColdStoreMiss?: boolean; followAlias?: boolean }): Promise<any> {
   if (!metaId || typeof metaId !== 'string') {
     cacheLogger.warn(`Invalid metaId provided: ${metaId}`);
     return { errorReason: 'invalid metaId' };
@@ -1827,7 +1977,7 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
     return includeVideos || componentName !== 'videos';
   });
   const componentNames = componentEntries.map(([componentName]) => componentName);
-  const cacheKeys = componentEntries.map(([, key]) => `v${ADDON_VERSION}:${key}`);
+  const cacheKeys = componentEntries.map(([, key]) => withEpoch(key));
 
   let componentResults: any[];
 
@@ -1856,9 +2006,53 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
     }
   }
 
+  try {
+    const coldStore = require('./metaColdStore');
+    if (coldStore.isEnabled()) {
+      const missing: Array<{ idx: number; key: string }> = [];
+      componentResults.forEach((result: any, idx: number) => {
+        if (result.data === null && cacheKeys[idx]) missing.push({ idx, key: cacheKeys[idx] });
+      });
+      if (missing.length > 0) {
+        const found = await coldStore.readThrough(missing.map(m => m.key));
+        if (found.size > 0) {
+          const rewarm = redis.pipeline();
+          for (const { idx, key } of missing) {
+            const hit = found.get(key);
+            if (!hit) continue;
+            componentResults[idx].data = hit.data;
+            rewarm.set(key, hit.buffer, 'EX', META_TTL());
+          }
+          rewarm.exec().catch(() => {});
+          cacheHealth.coldStoreHits += 1;
+          cacheHealth.coldStoreComponents += found.size;
+        } else if (countColdStoreMiss) {
+          cacheHealth.coldStoreMisses += 1;
+        }
+      }
+    }
+  } catch (coldErr: any) {
+    cacheLogger.warn(`[ColdStore] read-through failed for ${metaId}: ${coldErr?.message}`);
+  }
+
   const availableComponents = componentResults.filter((result: any) => result.data !== null);
 
   if (availableComponents.length === 0) {
+    if (followAlias) {
+      const aliasedId = await readMetaAlias({ config, metaId, type, useShowPoster });
+      if (aliasedId && aliasedId !== metaId) {
+        return reconstructMetaFromComponentsWithConfig({
+          config,
+          metaId: aliasedId,
+          type,
+          includeVideos,
+          useShowPoster,
+          countColdStoreMiss,
+          followAlias: false,
+        });
+      }
+    }
+
     const metaReconstructionKey = `meta:reconstructed:${metaId}`;
     updateCacheHealth(metaReconstructionKey, 'miss', true);
     return { errorReason: 'no cached components' };
@@ -1924,6 +2118,13 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
             updateCacheHealth(`meta:reconstructed:${metaId}`, 'miss', true);
             return { errorReason: 'corrupted: missing links' };
         }
+    }
+
+    const videosComponentForStamp = availableComponents.find((c: any) => c.componentName === 'videos');
+    if (videosComponentForStamp && bd._metaProvider && videosComponentForStamp.data._metaProvider && bd._metaProvider !== videosComponentForStamp.data._metaProvider) {
+        cacheLogger.warn(`[Reconstruct] Provider mismatch for ${metaId}: basic=${bd._metaProvider}, videos=${videosComponentForStamp.data._metaProvider}.`);
+        updateCacheHealth(`meta:reconstructed:${metaId}`, 'miss', true);
+        return { errorReason: 'provider mismatch between basic and videos' };
     }
   }
 
@@ -2013,7 +2214,7 @@ async function reconstructMetaFromComponentsWithConfig({ config, metaId, type = 
   const metaReconstructionKey = `meta:reconstructed:${metaId}`;
   updateCacheHealth(metaReconstructionKey, 'hit', true);
 
-  return { meta: projectMetaForUser(reconstructedMeta, config) };
+  return { meta: await projectMetaForUser(reconstructedMeta, config) };
 }
 
 async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () => Promise<any>, ttl: number = META_TTL(), options: any = {}, type: string | null = null, includeVideos: boolean = true, useShowPoster: boolean = false): Promise<any> {
@@ -2054,7 +2255,7 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
   cacheLogger.debug(`[Meta] Component reconstruction failed for ${metaId}${failureReason}`);
 
   const lockContextHash = getMetaSmartLockContextHash(config, metaId, type, includeVideos, useShowPoster);
-  const lockKey = `meta-smart:v${ADDON_VERSION}:${userUUID || 'global'}:${type || 'unknown'}:${lockContextHash}:videos=${includeVideos ? 1 : 0}:showPoster=${useShowPoster ? 1 : 0}:${metaId}`;
+  const lockKey = withEpoch(`meta-smart:${userUUID || 'global'}:${type || 'unknown'}:${lockContextHash}:videos=${includeVideos ? 1 : 0}:showPoster=${useShowPoster ? 1 : 0}:${metaId}`);
 
   return singleFlight(lockKey, async () => {
     const reconstructedAfterWait = await reconstructMetaFromComponentsWithConfig({
@@ -2063,6 +2264,7 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
       type,
       includeVideos,
       useShowPoster,
+      countColdStoreMiss: false,
     });
 
     if (reconstructedAfterWait && reconstructedAfterWait.meta) {
@@ -2081,6 +2283,13 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
     }
 
     const meta = result.meta;
+
+    if (meta.__degradedFallback) {
+      delete meta.__degradedFallback;
+      cacheLogger.warn(`[Meta] Skipping cache for degraded fallback result: ${metaId}`);
+      return result;
+    }
+
     let idToCache = meta.id;
 
     if (!idToCache || typeof idToCache !== 'string') {
@@ -2091,6 +2300,8 @@ async function cacheWrapMetaSmart(userUUID: string, metaId: string, method: () =
     if(metaId.startsWith('tun_')){
       idToCache = metaId;
     }
+
+    await writeMetaAlias({ config, metaId, aliasTo: idToCache, ttl, type, useShowPoster });
 
     return writeMetaComponentsWithConfig({
       config,
@@ -2116,7 +2327,7 @@ async function cacheComponentsPipeline(components: any[], ttl: number, options: 
   const queuedCommands: string[] = [];
 
   for (const { cacheKey, componentData } of components) {
-    const versionedKey = `v${ADDON_VERSION}:${cacheKey}`;
+    const versionedKey = withEpoch(cacheKey);
 
     try {
       const payload = await encodeCachePayload(componentData);
@@ -2151,21 +2362,22 @@ function cacheWrapJikanApi(key: string, method: () => Promise<any>, customTTL: n
   const subkey = key.replace(/\s/g, '-');
   const ttl = customTTL !== null ? customTTL : JIKAN_API_TTL;
 
-  const jikanResultClassifier = (result: any, error: any = null) => {
-    if (error) {
-      if (error.response?.status === 429 || error.message?.includes('429')) {
-        cacheLogger.debug(`Jikan Cache - Skipping cache for rate limit error: ${key}`);
-        return { type: 'SKIP_CACHE', ttl: 0 };
-      }
-      return classifyResult(result, error);
+  // The key has to be forwarded: without it classifyResult cannot tell this is an
+  // external API, and every endpoint returning a bare object reads as empty.
+  const jikanResultClassifier = (result: any, error: any = null, cacheKey: string | null = null) => {
+    if (error && (error.response?.status === 429 || error.message?.includes('429'))) {
+      cacheLogger.debug(`Jikan Cache - Skipping cache for rate limit error: ${key}`);
+      return { type: 'SKIP_CACHE', ttl: 0 };
     }
 
-    return classifyResult(result, error);
+    return classifyResult(result, error, cacheKey);
   };
 
-  return cacheWrapGlobal(`jikan-api:${subkey}`, method, ttl, {
+  // v2 carries the anime rating, which the pre-v2 payloads dropped on the way in.
+  return cacheWrapGlobal(`jikan-api:v2:${subkey}`, method, ttl, {
     resultClassifier: jikanResultClassifier,
-    ...options
+    ...options,
+    upstream: true,
   });
 }
 
@@ -2176,7 +2388,7 @@ function cacheWrapMDBListGenres(genreType: string, method: () => Promise<any>): 
 
 function cacheWrapTraktGenres(genreType: string, method: () => Promise<any>): Promise<any> {
   cacheLogger.debug(`Caching Trakt genres for type: ${genreType}`);
-  return cacheWrapGlobal(`trakt-genres-${genreType}`, method, MDBLIST_GENRES_TTL, { skipVersion: true });
+  return cacheWrapGlobal(`trakt-genres-${genreType}`, method, MDBLIST_GENRES_TTL, { upstream: true });
 }
 
 function cacheWrapStremThruGenres(catalogUrl: string, method: () => Promise<any>): Promise<any> {
@@ -2210,6 +2422,7 @@ async function cacheWrapStaticCatalog(userUUID: string, catalogKey: string, meth
     sfw: config.sfw || false,
     includeAdult: config.includeAdult || false,
     ageRating: config.ageRating || null,
+    ...(hasAgeRatingCap(config) ? { allowUnratedContent: allowsUnrated(config) } : {}),
     showPrefix: config.showPrefix || false,
     showMetaProviderAttribution: config.showMetaProviderAttribution || false,
     displayAgeRating: config.displayAgeRating || false,
@@ -2242,7 +2455,7 @@ function cacheWrapTvdbApi(key: string, method: () => Promise<any>): Promise<any>
 
   return cacheWrapGlobal(`tvdb-api:${key}`, method, TVDB_API_TTL, {
     resultClassifier: tvdbResultClassifier,
-    skipVersion: true
+    upstream: true
   });
 }
 
@@ -2275,6 +2488,10 @@ function getCacheHealth(): any {
     errors: cacheHealth.errors,
     cachedErrors: cacheHealth.cachedErrors,
     corruptedEntries: cacheHealth.corruptedEntries,
+    coldStoreHits: cacheHealth.coldStoreHits,
+    coldStoreMisses: cacheHealth.coldStoreMisses,
+    coldStoreComponents: cacheHealth.coldStoreComponents,
+    refreshAhead: getRefreshAheadStats(),
     hitRate: total > 0 ? ((cacheHealth.hits / total) * 100).toFixed(2) : '0.00',
     errorRate: total > 0 ? ((cacheHealth.errors / total) * 100).toFixed(2) : '0.00',
     totalRequests: total,
@@ -2291,6 +2508,10 @@ function clearCacheHealth(): void {
   cacheHealth.errors = 0;
   cacheHealth.cachedErrors = 0;
   cacheHealth.corruptedEntries = 0;
+  cacheHealth.coldStoreHits = 0;
+  cacheHealth.coldStoreMisses = 0;
+  cacheHealth.coldStoreComponents = 0;
+  resetRefreshAheadStats();
   cacheHealth.errorCounts = {};
   cacheHealth.keyAccessCounts.clear();
   cacheHealthLogger.info('Statistics cleared');
@@ -2330,6 +2551,7 @@ export {
   redis,
   cacheWrap,
   cacheWrapGlobal,
+  classifyResultAllowEmpty,
   deleteKeysByPattern,
   scanKeys,
   cacheWrapCatalog,
@@ -2343,6 +2565,7 @@ export {
   cacheWrapMetaComponents,
   reconstructMetaFromComponents,
   buildMetaComponentCacheKeys,
+  buildMetaAliasCacheKey,
   projectMetaForCatalogCache,
   projectCatalogPayloadForCache,
   writeMetaComponentsBatchWithConfig,
@@ -2361,6 +2584,7 @@ module.exports = {
   redis,
   cacheWrap,
   cacheWrapGlobal,
+  classifyResultAllowEmpty,
   deleteKeysByPattern,
   scanKeys,
   cacheWrapCatalog,
@@ -2374,6 +2598,7 @@ module.exports = {
   cacheWrapMetaComponents,
   reconstructMetaFromComponents,
   buildMetaComponentCacheKeys,
+  buildMetaAliasCacheKey,
   projectMetaForCatalogCache,
   projectCatalogPayloadForCache,
   writeMetaComponentsBatchWithConfig,

@@ -1,14 +1,28 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 
+export interface AuthSession {
+  accountId: string;
+  username: string;
+  email: string | null;
+  permissions: string[];
+}
+
+const DEFAULT_LOG_VIEWER_MAX_ENTRIES = 10000;
+
 interface AdminContextType {
   isAdmin: boolean;
   isGuest: boolean;
   adminKey: string | null;
+  /** Set when signed in through the identity provider. */
+  session: AuthSession | null;
+  ssoEnabled: boolean;
+  signOut: () => Promise<void>;
   login: (key: string) => Promise<boolean>;
   loginAsGuest: () => void;
   logout: () => void;
   isLoading: boolean;
   adminKeyConfigured: boolean;  // Indicates if ADMIN_KEY is set on server
+  logViewerMaxEntries: number;  // Most log entries the viewer keeps in the browser
   guestModeEnabled: boolean;    // Indicates if guest mode is available
 }
 
@@ -28,9 +42,12 @@ export function AdminProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [adminKeyConfigured, setAdminKeyConfigured] = useState(true);  // Assume configured until proven otherwise
   const [guestModeEnabled, setGuestModeEnabled] = useState(false);     // Guest mode disabled by default
+  const [logViewerMaxEntries, setLogViewerMaxEntries] = useState(DEFAULT_LOG_VIEWER_MAX_ENTRIES);
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [ssoEnabled, setSsoEnabled] = useState(false);
 
   // Fetch dashboard config to determine guest mode availability
-  const fetchDashboardConfig = async (): Promise<{ guestModeEnabled: boolean; adminKeyConfigured: boolean }> => {
+  const fetchDashboardConfig = async (): Promise<{ guestModeEnabled: boolean; adminKeyConfigured: boolean; logViewerMaxEntries: number }> => {
     try {
       const response = await fetch('/api/dashboard/config', {
         method: 'GET',
@@ -43,15 +60,35 @@ export function AdminProvider({ children }: { children: React.ReactNode }) {
         const data = await response.json();
         return {
           guestModeEnabled: data.guestModeEnabled ?? false,
-          adminKeyConfigured: data.adminKeyConfigured ?? true
+          adminKeyConfigured: data.adminKeyConfigured ?? true,
+          logViewerMaxEntries: Number(data.logViewerMaxEntries) > 0
+            ? Number(data.logViewerMaxEntries)
+            : DEFAULT_LOG_VIEWER_MAX_ENTRIES
         };
       }
       
       // If config endpoint fails, fall back to defaults
-      return { guestModeEnabled: false, adminKeyConfigured: true };
+      return { guestModeEnabled: false, adminKeyConfigured: true, logViewerMaxEntries: DEFAULT_LOG_VIEWER_MAX_ENTRIES };
     } catch (error) {
       console.error('Error fetching dashboard config:', error);
-      return { guestModeEnabled: false, adminKeyConfigured: true };
+      return { guestModeEnabled: false, adminKeyConfigured: true, logViewerMaxEntries: DEFAULT_LOG_VIEWER_MAX_ENTRIES };
+    }
+  };
+
+  const fetchAuthState = async (): Promise<{ ssoEnabled: boolean; session: AuthSession | null }> => {
+    try {
+      const statusResponse = await fetch('/api/auth/status');
+      const status = statusResponse.ok ? await statusResponse.json() : {};
+      if (!status.signedIn) {
+        return { ssoEnabled: Boolean(status.oidcEnabled), session: null };
+      }
+      const sessionResponse = await fetch('/api/auth/session');
+      if (!sessionResponse.ok) {
+        return { ssoEnabled: Boolean(status.oidcEnabled), session: null };
+      }
+      return { ssoEnabled: Boolean(status.oidcEnabled), session: await sessionResponse.json() };
+    } catch {
+      return { ssoEnabled: false, session: null };
     }
   };
 
@@ -96,6 +133,19 @@ export function AdminProvider({ children }: { children: React.ReactNode }) {
         const config = await fetchDashboardConfig();
         setGuestModeEnabled(config.guestModeEnabled);
         setAdminKeyConfigured(config.adminKeyConfigured);
+        setLogViewerMaxEntries(config.logViewerMaxEntries);
+
+        // A provider session outranks a pasted key, and carries its own
+        // permissions, so it is checked before anything is restored.
+        const auth = await fetchAuthState();
+        setSsoEnabled(auth.ssoEnabled);
+        if (auth.session) {
+          setSession(auth.session);
+          setIsAdmin(auth.session.permissions.includes('admin'));
+          setIsGuest(false);
+          setIsLoading(false);
+          return;
+        }
 
         // Check for existing guest session
         const guestSession = sessionStorage.getItem(GUEST_SESSION_STORAGE);
@@ -248,16 +298,31 @@ export function AdminProvider({ children }: { children: React.ReactNode }) {
     sessionStorage.removeItem(ADMIN_SESSION_STORAGE);
   };
 
+  const signOut = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // The cookie is cleared server side; nothing useful to do here.
+    }
+    setSession(null);
+    setIsAdmin(false);
+    setIsGuest(false);
+  };
+
   const value: AdminContextType = {
     isAdmin,
     isGuest,
     adminKey,
+    session,
+    ssoEnabled,
+    signOut,
     login,
     loginAsGuest,
     logout,
     isLoading,
     adminKeyConfigured,
-    guestModeEnabled
+    guestModeEnabled,
+    logViewerMaxEntries
   };
 
   return (

@@ -6,6 +6,14 @@
 import { CatalogConfig } from '@/contexts/ConfigContext';
 import { GenreSelection } from '@/data/genres';
 
+export function supportsMdblistScoreFilters(catalog: { id?: string } | null | undefined): boolean {
+  const id = catalog?.id;
+  if (typeof id !== 'string' || !id.startsWith('mdblist.')) return false;
+  return id !== 'mdblist.upnext'
+    && !id.startsWith('mdblist.discover.')
+    && !id.startsWith('mdblist.recommended.');
+}
+
 /**
  * Determines the catalog type based on MDBList list metadata
  * @param list - MDBList list object with mediatype, movies, shows, items properties
@@ -74,7 +82,7 @@ export function createMDBListCatalog(options: MDBListCatalogOptions): CatalogCon
     list,
     sort = 'default',
     order = 'asc',
-    cacheTTL = 86400, // Default 24 hours
+    cacheTTL,
     genreSelection = 'standard',
     displayTypeOverrides,
     sourceUrl,
@@ -102,7 +110,7 @@ export function createMDBListCatalog(options: MDBListCatalogOptions): CatalogCon
     source: 'mdblist',
     sort,
     order,
-    cacheTTL,
+    ...(cacheTTL !== undefined && { cacheTTL }),
     genreSelection,
     enableRatingPosters: true,
     ...(displayType && { displayType }),
@@ -148,7 +156,7 @@ export function createMDBListUnifiedDynamicCatalog(
     lists,
     username,
     listSlug,
-    cacheTTL = 86400,
+    cacheTTL,
     genreSelection = 'standard',
     displayTypeOverrides,
     listUrl,
@@ -169,7 +177,7 @@ export function createMDBListUnifiedDynamicCatalog(
     sourceUrl: `https://api.mdblist.com/lists/${encodeURIComponent(username)}/${encodeURIComponent(listSlug)}/items`,
     sort: 'default',
     order: 'asc',
-    cacheTTL,
+    ...(cacheTTL !== undefined && { cacheTTL }),
     genreSelection,
     enableRatingPosters: true,
     ...(displayType && { displayType }),
@@ -274,7 +282,7 @@ export function createLetterboxdCatalog(options: LetterboxdCatalogOptions): Cata
     itemCount = 0,
     isWatchlist,
     url,
-    cacheTTL = 86400, // Default 24 hours
+    cacheTTL,
     displayTypeOverrides,
   } = options;
 
@@ -287,7 +295,7 @@ export function createLetterboxdCatalog(options: LetterboxdCatalogOptions): Cata
     enabled: true,
     showInHome: true,
     source: 'letterboxd',
-    cacheTTL,
+    ...(cacheTTL !== undefined && { cacheTTL }),
     enableRatingPosters: true,
     ...(displayType && { displayType }),
     metadata: {
@@ -295,6 +303,133 @@ export function createLetterboxdCatalog(options: LetterboxdCatalogOptions): Cata
       isWatchlist,
       identifier,
       url,
+    },
+  };
+}
+
+// ============================================================================
+// TheTVDB List Catalog Creation
+// ============================================================================
+
+export interface TvdbListPreview {
+  id: number;
+  name: string;
+  overview?: string;
+  slug?: string;
+  image?: string;
+  isOfficial?: boolean;
+  url?: string;
+  movieCount: number;
+  seriesCount: number;
+  itemCount: number;
+}
+
+export interface TvdbListCatalogOptions {
+  list: TvdbListPreview;
+  mode?: 'all' | 'split';
+  displayTypeOverrides?: { movie?: string; series?: string };
+}
+
+/**
+ * Creates one or two catalogs for a TheTVDB list. A single-type list always
+ * collapses to one catalog, whatever the mode asks for.
+ */
+export function createTvdbListCatalogs(options: TvdbListCatalogOptions): CatalogConfig[] {
+  const { list, mode = 'all', displayTypeOverrides } = options;
+
+  const listId = String(list.id);
+  const listUrl = list.url || `https://thetvdb.com/lists/${list.slug || listId}`;
+  const baseMetadata = {
+    listId,
+    listName: list.name,
+    ...(list.overview ? { description: list.overview } : {}),
+    ...(list.slug ? { slug: list.slug } : {}),
+    url: listUrl,
+  };
+
+  const build = (
+    id: string,
+    type: 'movie' | 'series' | 'all',
+    name: string,
+    itemCount: number
+  ): CatalogConfig => ({
+    id,
+    type,
+    name,
+    enabled: true,
+    showInHome: true,
+    source: 'tvdb',
+    enableRatingPosters: true,
+    ...(getDisplayTypeOverride(type, displayTypeOverrides)
+      ? { displayType: getDisplayTypeOverride(type, displayTypeOverrides) }
+      : {}),
+    metadata: { ...baseMetadata, itemCount },
+  });
+
+  const hasMovies = list.movieCount > 0;
+  const hasSeries = list.seriesCount > 0;
+
+  if (!hasMovies && !hasSeries) return [];
+  if (!hasSeries) {
+    return [build(`tvdb.list.${listId}`, 'movie', list.name, list.movieCount)];
+  }
+  if (!hasMovies) {
+    return [build(`tvdb.list.${listId}`, 'series', list.name, list.seriesCount)];
+  }
+  if (mode === 'split') {
+    return [
+      build(`tvdb.list.${listId}.movies`, 'movie', `${list.name} (Movies)`, list.movieCount),
+      build(`tvdb.list.${listId}.series`, 'series', `${list.name} (Series)`, list.seriesCount),
+    ];
+  }
+  return [build(`tvdb.list.${listId}`, 'all', list.name, list.itemCount)];
+}
+
+// ============================================================================
+// TMDB Collection Catalog Creation
+// ============================================================================
+
+export interface TmdbCollectionPreview {
+  id: number;
+  name: string;
+  overview?: string;
+  poster?: string;
+  backdrop?: string;
+  url?: string;
+  itemCount?: number;
+}
+
+export interface TmdbCollectionCatalogOptions {
+  collection: TmdbCollectionPreview;
+  sortDirection?: 'asc' | 'desc';
+  hideUnreleased?: boolean;
+  cacheTTL?: number;
+  displayTypeOverrides?: { movie?: string; series?: string };
+}
+
+/** Creates a movie catalog for a TMDB collection. Collections never hold series. */
+export function createTmdbCollectionCatalog(options: TmdbCollectionCatalogOptions): CatalogConfig {
+  const { collection, sortDirection = 'asc', hideUnreleased = false, cacheTTL, displayTypeOverrides } = options;
+  const displayType = getDisplayTypeOverride('movie', displayTypeOverrides);
+
+  return {
+    id: `tmdb.collection.${collection.id}`,
+    type: 'movie',
+    name: collection.name,
+    enabled: true,
+    showInHome: true,
+    source: 'tmdb',
+    enableRatingPosters: true,
+    ...(cacheTTL ? { cacheTTL } : {}),
+    ...(displayType && { displayType }),
+    metadata: {
+      listId: String(collection.id),
+      listName: collection.name,
+      ...(collection.overview ? { description: collection.overview } : {}),
+      ...(collection.itemCount !== undefined ? { itemCount: collection.itemCount } : {}),
+      sortDirection,
+      ...(hideUnreleased ? { hideUnreleased: true } : {}),
+      url: collection.url || `https://www.themoviedb.org/collection/${collection.id}`,
     },
   };
 }
@@ -331,7 +466,7 @@ export function createCustomManifestCatalog(options: CustomManifestCatalogOption
     manifest,
     catalog,
     manifestUrl,
-    cacheTTL = 86400, // Default 24 hours
+    cacheTTL,
     displayTypeOverrides,
   } = options;
 
@@ -355,7 +490,7 @@ export function createCustomManifestCatalog(options: CustomManifestCatalogOption
     source: 'custom',
     sourceUrl: catalogUrl,
     genres: catalog.genres || [],
-    cacheTTL,
+    ...(cacheTTL !== undefined && { cacheTTL }),
     enableRatingPosters: true,
     manifestData: {
       ...catalog,
@@ -369,10 +504,24 @@ export function createCustomManifestCatalog(options: CustomManifestCatalogOption
 // FlixPatrol (Streaming Top 10) Catalog Creation
 // ============================================================================
 
+export interface FlixPatrolVariant {
+  id: string;
+  label: string;
+}
+
+export interface FlixPatrolSections {
+  hasMovies: boolean;
+  hasShows: boolean;
+  hasOverall: boolean;
+  movieVariants?: FlixPatrolVariant[];
+  seriesVariants?: FlixPatrolVariant[];
+  overallVariants?: FlixPatrolVariant[];
+}
+
 export interface FlixPatrolCatalogOptions {
   service: { id: string; name: string };
   country: { id: string; name: string; slug: string };
-  sections: { hasMovies: boolean; hasShows: boolean; hasOverall: boolean };
+  sections: FlixPatrolSections;
   displayTypeOverrides?: { movie?: string; series?: string };
 }
 
@@ -414,6 +563,8 @@ export function createFlixPatrolCatalogs(options: FlixPatrolCatalogOptions): Cat
       });
     }
   } else if (sections.hasOverall) {
+    // Default (promoted) overall catalog. English is the bare default, so it is
+    // never present in overallVariants — no phantom English row to suppress.
     catalogs.push({
       id: `flixpatrol.${service.id}.${country.id}.all`,
       type: 'all',
@@ -424,6 +575,19 @@ export function createFlixPatrolCatalogs(options: FlixPatrolCatalogOptions): Cat
       enableRatingPosters: true,
       metadata: { countrySlug: country.slug },
     });
+
+    for (const variant of sections.overallVariants ?? []) {
+      catalogs.push({
+        id: `flixpatrol.${service.id}.${country.id}.all.${variant.id}`,
+        type: 'all',
+        name: `Top 10 on ${service.name} (${country.name}) — ${variant.label}`,
+        enabled: true,
+        showInHome: true,
+        source: 'flixpatrol' as const,
+        enableRatingPosters: true,
+        metadata: { countrySlug: country.slug },
+      });
+    }
   }
 
   return catalogs;
@@ -442,7 +606,14 @@ export function createPublicMetaDBUpNextCatalog(): CatalogConfig {
   };
 }
 
-export function createPublicMetaDBListCatalog(list: { id: string; name: string }, mediaType: 'movie' | 'series' | 'all' = 'all'): CatalogConfig {
+export function createPublicMetaDBListCatalog(
+  list: { id: string; name: string; is_public?: boolean; type?: string },
+  mediaType: 'movie' | 'series' | 'all' = 'all'
+): CatalogConfig {
+  const metadata: CatalogConfig['metadata'] = {};
+  if (typeof list.is_public === 'boolean') metadata.isPublic = list.is_public;
+  if (list.type) metadata.listType = list.type;
+
   return {
     id: `publicmetadb.list.${list.id}`,
     type: mediaType,
@@ -450,6 +621,7 @@ export function createPublicMetaDBListCatalog(list: { id: string; name: string }
     enabled: true,
     showInHome: true,
     source: 'publicmetadb' as const,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   };
 }
 

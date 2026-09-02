@@ -14,6 +14,7 @@ import {
   useDashboardOperations,
   useDashboardUsers,
   useDashboardLogs,
+  type LogStreamFilters,
   useDashboardSettings,
   type DashboardTab,
 } from "@/hooks/useDashboardQueries";
@@ -31,6 +32,7 @@ import {
   Shield,
   Users,
   Key,
+  LogIn,
   LogOut,
   AlertCircle,
   ChevronLeft,
@@ -44,6 +46,7 @@ import { DashboardOverview } from "./DashboardOverview";
 import { DashboardPerformance } from "./DashboardPerformance";
 import { DashboardOperations } from "./DashboardOperations";
 import { DashboardUsers } from "./DashboardUsers";
+import DashboardAccounts from "./DashboardAccounts";
 import { DashboardSettings } from "./DashboardSettings";
 
 
@@ -70,7 +73,7 @@ function AdminLoginModal({
   adminKeyNotConfigured,
   guestModeEnabled 
 }: AdminLoginModalProps) {
-  const { login, loginAsGuest, isLoading } = useAdmin();
+  const { login, loginAsGuest, isLoading, ssoEnabled, session, signOut } = useAdmin();
   const [inputAdminKey, setInputAdminKey] = useState("");
   const [error, setError] = useState("");
   const [showAdminInput, setShowAdminInput] = useState(false);
@@ -110,8 +113,55 @@ function AdminLoginModal({
     setError("");
   };
 
+  if (session) {
+    return (
+      <Dialog open={isOpen} onOpenChange={() => {}}>
+        <DialogContent
+          className="sm:max-w-md"
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onEscapeKeyDown={(e) => e.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertCircle className="h-5 w-5 text-amber-500" />
+              No Dashboard Access
+            </DialogTitle>
+            <DialogDescription>
+              You are signed in as {session.username}, but this account does not have dashboard access.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="p-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-md text-sm text-amber-700 dark:text-amber-300">
+              <p>Dashboard access comes from your identity provider. Ask an administrator to grant your account the admin permission, then sign in again.</p>
+            </div>
+            {guestModeEnabled && (
+              <Button className="w-full justify-start h-auto py-4" variant="outline" onClick={handleGuestLogin}>
+                <div className="flex items-center gap-3">
+                  <Users className="h-5 w-5 text-muted-foreground" />
+                  <div className="text-left">
+                    <p className="font-medium">Continue as Guest</p>
+                    <p className="text-xs text-muted-foreground">View public metrics without authentication</p>
+                  </div>
+                </div>
+              </Button>
+            )}
+            <div className="flex justify-between gap-2">
+              <Button variant="ghost" size="sm" onClick={handleGoBack}>
+                Go Back
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => signOut()}>
+                <LogOut className="h-4 w-4 mr-2" />
+                Sign Out
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
   // Show specific message when ADMIN_KEY is not configured AND guest mode is disabled
-  if (adminKeyNotConfigured && !guestModeEnabled) {
+  if (adminKeyNotConfigured && !guestModeEnabled && !ssoEnabled) {
     return (
       <Dialog open={isOpen} onOpenChange={() => {}}>
         <DialogContent 
@@ -229,13 +279,33 @@ function AdminLoginModal({
             Dashboard Access
           </DialogTitle>
           <DialogDescription>
-            {guestModeEnabled 
+            {guestModeEnabled || ssoEnabled
               ? "Choose how you'd like to access the dashboard."
               : "Enter your admin key to access the dashboard."
             }
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
+          {/* SSO Option - Only shown when a provider is configured */}
+          {ssoEnabled && (
+            <Button
+              className="w-full justify-start h-auto py-4"
+              variant="outline"
+              onClick={() => {
+                const next = encodeURIComponent(window.location.pathname + window.location.search);
+                window.location.href = `/api/auth/oidc/start?next=${next}`;
+              }}
+            >
+              <div className="flex items-center gap-3">
+                <LogIn className="h-5 w-5 text-primary" />
+                <div className="text-left">
+                  <p className="font-medium">Sign in with SSO</p>
+                  <p className="text-xs text-muted-foreground">Your permissions come from your identity provider</p>
+                </div>
+              </div>
+            </Button>
+          )}
+
           {/* Admin Login Option */}
           <Button 
             className="w-full justify-start h-auto py-4" 
@@ -246,7 +316,9 @@ function AdminLoginModal({
               <Key className="h-5 w-5 text-primary" />
               <div className="text-left">
                 <p className="font-medium">Admin Login</p>
-                <p className="text-xs text-muted-foreground">Full access to all dashboard features</p>
+                <p className="text-xs text-muted-foreground">
+                  {ssoEnabled ? 'Use the admin key instead' : 'Full access to all dashboard features'}
+                </p>
               </div>
             </div>
           </Button>
@@ -286,12 +358,15 @@ type AccessLevel = 'none' | 'guest' | 'admin';
 interface AdminStatusBadgeProps {}
 
 function AdminStatusBadge({}: AdminStatusBadgeProps) {
-  const { isAdmin, isGuest, adminKey, logout } = useAdmin();
+  const { isAdmin, isGuest, adminKey, session, logout, signOut } = useAdmin();
 
   // Determine current access level based on AdminContext state
   const accessLevel: AccessLevel = isAdmin ? 'admin' : isGuest ? 'guest' : 'none';
 
-  const handleLogout = () => {
+  // A provider session lives on the server, so clearing local state alone would
+  // leave the user signed in.
+  const handleLogout = async () => {
+    if (session) await signOut();
     logout();
   };
 
@@ -305,7 +380,7 @@ function AdminStatusBadge({}: AdminStatusBadgeProps) {
       {accessLevel === 'admin' ? (
         <Badge variant="default" className="bg-green-600">
           <Shield className="h-3 w-3 mr-1" />
-          Admin
+          {session?.username || 'Admin'}
         </Badge>
       ) : (
         <Badge variant="secondary" className="bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200">
@@ -313,7 +388,7 @@ function AdminStatusBadge({}: AdminStatusBadgeProps) {
           Guest
         </Badge>
       )}
-      {(adminKey || isGuest) && (
+      {(adminKey || isGuest || session) && (
         <Button variant="outline" size="sm" onClick={handleLogout}>
           <LogOut className="h-4 w-4 mr-1" />
           Logout
@@ -325,13 +400,14 @@ function AdminStatusBadge({}: AdminStatusBadgeProps) {
 
 // Main Dashboard Component
 export function Dashboard() {
-  const { isAdmin, isGuest, adminKey, isLoading, adminKeyConfigured, guestModeEnabled } = useAdmin();
+  const { isAdmin, isGuest, adminKey, isLoading, adminKeyConfigured, guestModeEnabled, ssoEnabled } = useAdmin();
   const { isMobile } = useBreakpoint();
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [activeTab, setActiveTab] = useState<DashboardTab>('overview');
   const [activeMobileSection, setActiveMobileSection] = useState<DashboardTab | undefined>(undefined);
   const [contentTimeframe, setContentTimeframe] = useState('today');
   const [logsPaused, setLogsPaused] = useState(false);
+  const [logFilters, setLogFilters] = useState<LogStreamFilters>({});
 
   const navigateToTab = (tab: string) => {
     setActiveTab(tab as DashboardTab);
@@ -351,7 +427,7 @@ export function Dashboard() {
   const systemQuery = useDashboardSystem(queryOptions);
   const operationsQuery = useDashboardOperations(queryOptions);
   const usersQuery = useDashboardUsers(queryOptions);
-  const logsQuery = useDashboardLogs({ ...queryOptions, paused: logsPaused });
+  const logsQuery = useDashboardLogs({ ...queryOptions, paused: logsPaused, filters: logFilters });
   const settingsQuery = useDashboardSettings(queryOptions);
 
   // Refetch data when tab changes (only if not already fetching)
@@ -475,6 +551,8 @@ export function Dashboard() {
   // Calculate grid columns based on admin status
   const gridCols = isAdmin ? "grid-cols-6" : "grid-cols-4";
 
+  const usersTabLabel = ssoEnabled ? "Accounts" : "Users";
+
   // Dashboard pages configuration - base pages available to all authenticated users
   const dashboardPages = [
     {
@@ -546,13 +624,16 @@ export function Dashboard() {
       },
       {
         value: "users",
-        title: "Users",
+        title: usersTabLabel,
         component: (
-          <DashboardUsers
-            data={dashboardData.users}
-            loading={dashboardData.loading}
-            activeTab={activeTab}
-          />
+          <div className="space-y-6">
+            {ssoEnabled && <DashboardAccounts activeTab={activeTab} />}
+            <DashboardUsers
+              data={dashboardData.users}
+              loading={dashboardData.loading}
+              activeTab={activeTab}
+            />
+          </div>
         ),
       },
       {
@@ -564,6 +645,7 @@ export function Dashboard() {
             paused={logsPaused}
             onPauseToggle={() => setLogsPaused((p) => !p)}
             onClear={logsQuery.resetLogs}
+            onFiltersChange={setLogFilters}
           />
         ),
       },
@@ -702,7 +784,7 @@ export function Dashboard() {
                 { value: "system", label: "System" },
                 ...(accessLevel === 'admin' ? [
                   { value: "operations", label: "Ops" },
-                  { value: "users", label: "Users" },
+                  { value: "users", label: usersTabLabel },
                   { value: "logs", label: "Logs" },
                   { value: "settings", label: "Settings" },
                 ] : []),
@@ -785,7 +867,8 @@ export function Dashboard() {
               />
             </TabsContent>
 
-            <TabsContent value="users" className="mt-0">
+            <TabsContent value="users" className="mt-0 space-y-6">
+              {ssoEnabled && <DashboardAccounts activeTab={activeTab} />}
               <DashboardUsers
                 data={dashboardData.users}
                 loading={dashboardData.loading}
@@ -799,6 +882,7 @@ export function Dashboard() {
                 paused={logsPaused}
                 onPauseToggle={() => setLogsPaused((p) => !p)}
                 onClear={logsQuery.resetLogs}
+                onFiltersChange={setLogFilters}
               />
             </TabsContent>
 

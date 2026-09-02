@@ -8,6 +8,16 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -38,6 +48,12 @@ import {
   Loader2,
   X,
   Plus,
+  Image,
+  Palette,
+  LayoutGrid,
+  Snowflake,
+  Puzzle,
+  Search,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -54,37 +70,49 @@ interface DashboardSettingsProps {
 const CATEGORY_ICONS: Record<string, React.ReactNode> = {
   "API Keys": <Key className="h-4 w-4" />,
   "OAuth": <Shield className="h-4 w-4" />,
+  "Sign-In & Access": <Lock className="h-4 w-4" />,
+  "Appearance": <Palette className="h-4 w-4" />,
+  "Catalogs & Search": <LayoutGrid className="h-4 w-4" />,
+  "Images & Art": <Image className="h-4 w-4" />,
+  "Providers": <Puzzle className="h-4 w-4" />,
   "Cache": <Database className="h-4 w-4" />,
-  "Features": <Zap className="h-4 w-4" />,
-  "Essential Warming": <Flame className="h-4 w-4" />,
-  "Comprehensive Warming": <Flame className="h-4 w-4" />,
-  "MAL Warming": <Flame className="h-4 w-4" />,
-  "Rate Limiting": <Gauge className="h-4 w-4" />,
+  "Cold Store": <Snowflake className="h-4 w-4" />,
+  "Warming: Popular": <Flame className="h-4 w-4" />,
+  "Warming: Full": <Flame className="h-4 w-4" />,
+  "Warming: MAL": <Flame className="h-4 w-4" />,
+  "Rate Limits": <Gauge className="h-4 w-4" />,
   "Data Updates": <Calendar className="h-4 w-4" />,
   "Proxy": <Globe className="h-4 w-4" />,
   "Diagnostics": <Activity className="h-4 w-4" />,
-  "Server": <Server className="h-4 w-4" />,
+  "Server & Storage": <Server className="h-4 w-4" />,
 };
 
 const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   "API Keys": "Third-party API keys for metadata providers",
-  "OAuth": "OAuth credentials — read-only, set via environment",
-  "Cache": "Cache duration and behavior",
-  "Features": "Feature toggles and customization",
-  "Essential Warming": "Background warming for trending and popular content",
-  "Comprehensive Warming": "Full catalog warming for specific users",
-  "MAL Warming": "MyAnimeList catalog warming configuration",
-  "Rate Limiting": "API rate limiting and request throttling",
-  "Data Updates": "Intervals for updating external data mappings",
-  "Proxy": "HTTP/SOCKS proxy configuration",
-  "Diagnostics": "Logging, health checks, and monitoring",
-  "Server": "Server configuration — requires restart",
+  "OAuth": "OAuth credentials for the services users link their accounts to",
+  "Sign-In & Access": "Who can reach the config page and dashboard, and how they authenticate",
+  "Appearance": "Addon name, logo and description shown to users",
+  "Catalogs & Search": "Catalog limits, page sizes and search behavior",
+  "Images & Art": "Poster, logo and backdrop caching, the art proxy, and image warming",
+  "Providers": "Per-provider endpoints, credentials and pacing",
+  "Cache": "Cache lifetimes, compression and cleanup",
+  "Cold Store": "On-disk tier for settled metadata that rarely changes",
+  "Warming: Popular": "Background warming for trending and popular content",
+  "Warming: Full": "Full catalog warming for specific users",
+  "Warming: MAL": "MyAnimeList catalog warming",
+  "Rate Limits": "Request throttling and concurrency ceilings",
+  "Data Updates": "Intervals for refreshing external id mappings",
+  "Proxy": "HTTP and SOCKS proxy routing",
+  "Diagnostics": "Logging, health checks and monitoring",
+  "Server & Storage": "Ports, database and Redis. Most of these need a restart",
 };
 
 const CATEGORY_ORDER = [
-  "API Keys", "OAuth", "Cache", "Features",
-  "Essential Warming", "Comprehensive Warming", "MAL Warming",
-  "Rate Limiting", "Data Updates", "Proxy", "Diagnostics", "Server",
+  "API Keys", "OAuth", "Sign-In & Access",
+  "Appearance", "Catalogs & Search", "Images & Art", "Providers",
+  "Cache", "Cold Store",
+  "Warming: Popular", "Warming: Full", "Warming: MAL",
+  "Rate Limits", "Data Updates", "Proxy", "Diagnostics", "Server & Storage",
 ];
 
 function TagsInput({
@@ -196,6 +224,9 @@ function SettingRow({ setting }: { setting: SettingItem }) {
   const [localValue, setLocalValue] = useState(setting.value);
   const [revealed, setRevealed] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<
+    { kind: "update"; value: string; reason: string } | { kind: "reset"; reason: string } | null
+  >(null);
   const updateMutation = useUpdateSetting();
   const resetMutation = useResetSetting();
   const prevServerValue = useRef(setting.value);
@@ -213,14 +244,22 @@ function SettingRow({ setting }: { setting: SettingItem }) {
     : "";
   const displayValue = setting.sensitive && !revealed && !hasChanged ? maskedValue : localValue;
 
+  function needsConfirmation(err: any, pending: { kind: "update"; value: string } | { kind: "reset" }): boolean {
+    if (!err?.requiresConfirmation) return false;
+    setPendingConfirm({ ...pending, reason: err.reason || "This change affects your own access." });
+    return true;
+  }
+
   async function handleSave() {
     setSaving(true);
     try {
       await updateMutation.mutateAsync({ key: setting.key, value: localValue });
       toast.success(`${setting.label} updated`);
     } catch (err: any) {
-      toast.error(err.message || "Failed to save");
-      setLocalValue(setting.value);
+      if (!needsConfirmation(err, { kind: "update", value: localValue })) {
+        toast.error(err.message || "Failed to save");
+        setLocalValue(setting.value);
+      }
     } finally {
       setSaving(false);
     }
@@ -228,10 +267,30 @@ function SettingRow({ setting }: { setting: SettingItem }) {
 
   async function handleReset() {
     try {
-      await resetMutation.mutateAsync(setting.key);
+      await resetMutation.mutateAsync({ key: setting.key });
       toast.success(`${setting.label} reset to default`);
     } catch (err: any) {
-      toast.error(err.message || "Failed to reset");
+      if (!needsConfirmation(err, { kind: "reset" })) {
+        toast.error(err.message || "Failed to reset");
+      }
+    }
+  }
+
+  async function handleConfirmed() {
+    if (!pendingConfirm) return;
+    const pending = pendingConfirm;
+    setPendingConfirm(null);
+    try {
+      if (pending.kind === "update") {
+        await updateMutation.mutateAsync({ key: setting.key, value: pending.value, confirm: true });
+        toast.success(`${setting.label} updated`);
+      } else {
+        await resetMutation.mutateAsync({ key: setting.key, confirm: true });
+        toast.success(`${setting.label} reset to default`);
+      }
+    } catch (err: any) {
+      toast.error(err.message || "Failed to save");
+      setLocalValue(setting.value);
     }
   }
 
@@ -317,6 +376,7 @@ function SettingRow({ setting }: { setting: SettingItem }) {
                 {
                   onSuccess: () => toast.success(`${setting.label} updated`),
                   onError: (err: any) => {
+                    if (needsConfirmation(err, { kind: "update", value: val })) return;
                     toast.error(err.message || "Failed to save");
                     setLocalValue(setting.value);
                   },
@@ -335,6 +395,7 @@ function SettingRow({ setting }: { setting: SettingItem }) {
                 {
                   onSuccess: () => toast.success(`${setting.label} updated`),
                   onError: (err: any) => {
+                    if (needsConfirmation(err, { kind: "update", value: val })) return;
                     toast.error(err.message || "Failed to save");
                     setLocalValue(setting.value);
                   },
@@ -399,23 +460,54 @@ function SettingRow({ setting }: { setting: SettingItem }) {
           </Button>
         )}
       </div>
+
+      <AlertDialog open={pendingConfirm !== null} onOpenChange={(open) => { if (!open) setPendingConfirm(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm this change</AlertDialogTitle>
+            <AlertDialogDescription>{pendingConfirm?.reason}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              onClick={() => {
+                setPendingConfirm(null);
+                setLocalValue(setting.value);
+              }}
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmed}>Save anyway</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
 
 export function DashboardSettings({ data }: DashboardSettingsProps) {
-  const settings = data?.settings || [];
+  const settings = useMemo(() => data?.settings || [], [data?.settings]);
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+
+  const visible = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    if (!needle) return settings;
+    return settings.filter((s) =>
+      s.label.toLowerCase().includes(needle) ||
+      s.key.toLowerCase().includes(needle) ||
+      (s.description || "").toLowerCase().includes(needle)
+    );
+  }, [settings, filter]);
 
   const grouped = useMemo(() => {
     const map = new Map<string, SettingItem[]>();
-    for (const s of settings) {
+    for (const s of visible) {
       const list = map.get(s.category) || [];
       list.push(s);
       map.set(s.category, list);
     }
     return map;
-  }, [settings]);
+  }, [visible]);
 
   const categories = useMemo(
     () => CATEGORY_ORDER.filter((c) => grouped.has(c)),
@@ -444,6 +536,15 @@ export function DashboardSettings({ data }: DashboardSettingsProps) {
   return (
     <div className="space-y-4">
       <RestartManager pendingLabels={pendingLabels} canRestart={data?.canRestart} />
+      <div className="relative max-w-md">
+        <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Search settings by name, key or description"
+          className="pl-8 h-9"
+        />
+      </div>
       <div className="flex gap-6">
       <nav className="hidden lg:block w-52 shrink-0 sticky top-0 self-start space-y-1">
         {categories.map((cat) => (
@@ -466,6 +567,11 @@ export function DashboardSettings({ data }: DashboardSettingsProps) {
       </nav>
 
       <div className="flex-1 min-w-0 space-y-6">
+        {categories.length === 0 && (
+          <div className="py-16 text-center text-muted-foreground">
+            No setting matches "{filter}".
+          </div>
+        )}
         {categories.map((cat) => (
           <Card key={cat} id={`settings-cat-${cat}`}>
             <CardHeader className="pb-2">

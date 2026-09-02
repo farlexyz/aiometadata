@@ -6,13 +6,16 @@ import { getGenresFromStremThruCatalog, fetchStremThruCatalog } from "../utils/s
 import { fetchTraktGenres } from "../utils/traktUtils";
 import { getGenresBySelection } from "../static/genres";
 import buildInfo from "./buildInfo";
-import catalogsTranslations from "../static/translations.json";
-import CATALOG_TYPES from "../static/catalog-types.json";
+import catalogsTranslationsJson from "../static/translations.json";
+import catalogTypesJson from "../static/catalog-types.json";
 const jikan: any = require('./mal');
 const DEFAULT_LANGUAGE = "en-US";
+const catalogsTranslations: Record<string, Record<string, string>> = catalogsTranslationsJson;
+const CATALOG_TYPES: Record<string, any> = catalogTypesJson;
 import { cacheWrapJikanApi, cacheWrapGlobal, cacheWrapStremThruGenres } from './getCache';
 import { mergeGenreOptions } from '../utils/mergedCatalog';
 import consola from 'consola';
+import { hasAnyWatchTrackingEnabled } from './watchTracking';
 const logger = consola.withTag('Manifest');
 
 
@@ -25,8 +28,6 @@ function manifestLogoUrl() {
   return custom || `${host}/logo.png`;
 }
 
-const MANIFEST_CACHE_TTL = 5 * 60;
-
 function generateArrayOfYears(maxYears: number): string[] {
   const max = new Date().getFullYear();
   const min = max - maxYears;
@@ -38,12 +39,12 @@ function generateArrayOfYears(maxYears: number): string[] {
 }
 
 function setOrderLanguage(language: string, languagesArray: any[]): string[] {
-  const languageObj = languagesArray.find((lang: any) => lang.iso_639_1 === language);
-  const fromIndex = languagesArray.indexOf(languageObj);
-  const element = languagesArray.splice(fromIndex, 1)[0];
-  languagesArray = languagesArray.sort((a: any, b: any) => (a.name > b.name ? 1 : -1));
-  languagesArray.splice(0, 0, element);
-  return [...new Set(languagesArray.map((el: any) => el.name))];
+  // Copy before sorting: the array comes straight out of the global cache.
+  const sorted = [...languagesArray].sort((a: any, b: any) => (a.name > b.name ? 1 : -1));
+  const base = String(language || '').split('-')[0];
+  const index = sorted.findIndex((lang: any) => lang.iso_639_1 === base);
+  if (index > 0) sorted.unshift(sorted.splice(index, 1)[0]);
+  return [...new Set(sorted.map((el: any) => el.name))];
 }
 
 function loadTranslations(language: string): Record<string, string> {
@@ -103,7 +104,7 @@ function createCatalog(id: string, type: string, catalogDef: any, options: strin
 
   let pageSize: number;
   if (id.startsWith('mal.')) {
-    pageSize = 25;
+    pageSize = parseInt(process.env.MAL_PAGE_SIZE as string) || 25;
   } else {
     pageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20;
   }
@@ -133,6 +134,12 @@ function createCatalog(id: string, type: string, catalogDef: any, options: strin
   };
 }
 
+const MOVIELENS_GENRES = [
+  'Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary',
+  'Drama', 'Family', 'Fantasy', 'History', 'Horror', 'Music', 'Mystery',
+  'Romance', 'Science Fiction', 'TV Movie', 'Thriller', 'War', 'Western'
+];
+
 function getCatalogDefinition(catalogId: string): any {
   const [provider, catalogType] = catalogId.split('.');
 
@@ -149,7 +156,7 @@ function getCatalogDefinition(catalogId: string): any {
   return null;
 }
 
-function getOptionsForCatalog(catalogDef: any, type: string, showInHome: boolean, { years, genres_movie, genres_series, filterLanguages }: { years: string[]; genres_movie: string[]; genres_series: string[]; filterLanguages: string[] }): string[] {
+function getOptionsForCatalog(catalogDef: any, type: string, { years, genres_movie, genres_series, filterLanguages }: { years: string[]; genres_movie: string[]; genres_series: string[]; filterLanguages: string[] }): string[] {
   if (catalogDef.defaultOptions) return catalogDef.defaultOptions;
 
   const movieGenres = [...genres_movie]
@@ -193,7 +200,9 @@ async function createMDBListCatalog(userCatalog: any, mdblistKey: string, prefet
       logger.info(`MDBList using ${genres.length} static fallback genres for selection: ${genreSelection}`);
     }
 
-    const genreOptions = userCatalog.showInHome ? genres : ['None', ...genres];
+    const genreOptions = userCatalog.id.startsWith('mdblist.recommended.')
+      ? ['None']
+      : (userCatalog.showInHome ? genres : ['None', ...genres]);
 
     const catalogType = userCatalog.displayType || userCatalog.type;
 
@@ -315,6 +324,35 @@ async function createTMDBListCatalog(userCatalog: any, movieGenres: string[] = [
   }
 }
 
+function createTMDBCollectionCatalog(userCatalog: any, movieGenres: string[] = [], showPrefix: boolean = false, prefixName: string = "AIOMetadata"): any {
+  try {
+    logger.debug(`Creating TMDB Collection catalog: ${userCatalog.id}`);
+
+    const catalogType = userCatalog.displayType || 'movie';
+    const genreOptions = movieGenres.length > 0
+      ? (userCatalog.showInHome ? movieGenres : ['None', ...movieGenres])
+      : ['None'];
+
+    const catalog = {
+      id: userCatalog.id,
+      type: catalogType,
+      name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name}`,
+      pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
+      extra: [
+        { name: "genre", options: genreOptions, isRequired: userCatalog.showInHome ? false : true },
+        { name: "skip" },
+      ],
+      showInHome: userCatalog.showInHome
+    };
+
+    logger.debug(`TMDB Collection catalog created successfully: ${catalog.id}`);
+    return catalog;
+  } catch (error: any) {
+    logger.error(`Error creating TMDB Collection catalog ${userCatalog.id}:`, error.message);
+    return null;
+  }
+}
+
 function createTMDBDiscoverCatalog(userCatalog: any, movieGenres: string[] = [], seriesGenres: string[] = [], showPrefix: boolean = false, prefixName: string = "AIOMetadata"): any {
   try {
     logger.debug(`Creating TMDB Discover catalog: ${userCatalog.id} (${userCatalog.type})`);
@@ -379,6 +417,34 @@ function createTVDBDiscoverCatalog(userCatalog: any, genres: string[] = [], show
   }
 }
 
+function createTVDBListCatalog(userCatalog: any, showPrefix: boolean = false, prefixName: string = "AIOMetadata"): any {
+  try {
+    logger.debug(`Creating TVDB List catalog: ${userCatalog.id} (${userCatalog.type})`);
+
+    const catalogType = userCatalog.displayType || userCatalog.type;
+    const extra: any[] = [];
+    if (!userCatalog.showInHome) {
+      extra.push({ name: "genre", options: ['None'], isRequired: true });
+    }
+    extra.push({ name: "skip" });
+
+    const catalog = {
+      id: userCatalog.id,
+      type: catalogType,
+      name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name}`,
+      pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
+      extra,
+      showInHome: userCatalog.showInHome
+    };
+
+    logger.debug(`TVDB List catalog created successfully: ${catalog.id}`);
+    return catalog;
+  } catch (error: any) {
+    logger.error(`Error creating TVDB List catalog ${userCatalog.id}:`, error.message);
+    return null;
+  }
+}
+
 async function createLetterboxdCatalog(userCatalog: any, showPrefix: boolean = false, prefixName: string = "AIOMetadata"): Promise<any> {
   try {
     logger.debug(`Creating Letterboxd catalog: ${userCatalog.id} (${userCatalog.type})`);
@@ -436,9 +502,6 @@ async function createStremThruCatalog(userCatalog: any, showPrefix: boolean = fa
     }
 
     logger.debug(`Creating StremThru catalog: ${userCatalog.id}`);
-
-    const manifestId = parts[1];
-    const catalogId = parts[2];
 
     const catalogUrl = userCatalog.sourceUrl || userCatalog.source;
     if (!catalogUrl) {
@@ -543,7 +606,28 @@ function createAniListCatalog(userCatalog: any, showPrefix: boolean = false, pre
   }
 }
 
-async function createMalCatalog(userCatalog: any, genres: string[], showPrefix: boolean = false, prefixName: string = "AIOMetadata"): Promise<any> {
+function createMalUserListCatalog(userCatalog: any, showPrefix: boolean = false, prefixName: string = "AIOMetadata"): any {
+  try {
+    const catalogType = userCatalog.displayType || userCatalog.type || 'series';
+
+    return {
+      id: userCatalog.id,
+      type: catalogType,
+      name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name}`,
+      pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
+      extra: [
+        { name: "genre", options: ['None'], isRequired: userCatalog.showInHome ? false : true },
+        { name: "skip" },
+      ],
+      showInHome: userCatalog.showInHome
+    };
+  } catch (error: any) {
+    logger.error(`Error creating MAL user list catalog ${userCatalog.id}:`, error.message);
+    return null;
+  }
+}
+
+async function createMalCatalog(userCatalog: any, genres: string[], showPrefix: boolean = false): Promise<any> {
   try {
     logger.debug(`Creating MAL discover catalog: ${userCatalog.id} (${userCatalog.type})`);
 
@@ -556,20 +640,16 @@ async function createMalCatalog(userCatalog: any, genres: string[], showPrefix: 
       type: 'anime',
       name: showPrefix ? `${userCatalog.name}` : userCatalog.name,
       extra: [
-        { name: "genre", options: genreOptions, isRequired: userCatalog.showInHome ? false : true },
+        {
+          name: "genre",
+          options: genreOptions,
+          isRequired: !userCatalog.showInHome,
+          ...(userCatalog.showInHome ? {} : { default: 'None' }),
+        },
         { name: 'skip' }
       ],
       showInHome: userCatalog.showInHome
     };
-
-    if (!userCatalog.showInHome) {
-      catalog.extra.unshift({
-        name: "genre",
-        options: ["None"],
-        isRequired: true,
-        default: "None"
-      });
-    }
 
     logger.debug(`MAL discover catalog created successfully: ${catalog.id}`);
     return catalog;
@@ -691,37 +771,37 @@ async function createSimklCatalog(userCatalog: any, showPrefix: boolean = false,
     };
 
     const catalogType = userCatalog.displayType || userCatalog.type;
+    const labels = SOURCE_LABELS[userCatalog.type] || ['all'];
+
+    let genreExtra: any;
+    if (userCatalog.id.startsWith('simkl.trending.') || userCatalog.id.startsWith('simkl.recipe.')) {
+      const defaultInterval = userCatalog.metadata?.interval
+        || (userCatalog.id.startsWith('simkl.recipe.') ? 'week' : 'today');
+      genreExtra = {
+        name: "genre",
+        options: userCatalog.showInHome ? ['today', 'week', 'month'] : ['None', 'today', 'week', 'month'],
+        isRequired: !userCatalog.showInHome,
+        default: userCatalog.showInHome ? defaultInterval : 'None',
+      };
+    } else if (userCatalog.showInHome) {
+      genreExtra = { name: "genre", options: labels, isRequired: false };
+    } else {
+      genreExtra = {
+        name: "genre",
+        options: userCatalog.id.startsWith('simkl.discover.') ? ['None', ...labels] : ['None'],
+        isRequired: true,
+        default: 'None',
+      };
+    }
 
     const catalog: any = {
       id: userCatalog.id,
       type: catalogType,
       name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name}`,
       pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
-      extra: [
-        { name: "genre", options: SOURCE_LABELS[userCatalog.type], isRequired: userCatalog.showInHome ? false : true },
-        { name: "skip" },
-      ],
+      extra: [genreExtra, { name: "skip" }],
       showInHome: userCatalog.showInHome
     };
-
-    if (userCatalog.id.startsWith('simkl.trending.') || userCatalog.id.startsWith('simkl.recipe.')) {
-      const intervalOptions = userCatalog.showInHome ? ['today', 'week', 'month'] : ['None', 'today', 'week', 'month'];
-      const defaultInterval = userCatalog.metadata?.interval || (userCatalog.id.startsWith('simkl.recipe.') ? 'week' : 'today');
-
-      catalog.extra.unshift({
-        name: "genre",
-        options: intervalOptions,
-        isRequired: !userCatalog.showInHome,
-        default: userCatalog.showInHome ? defaultInterval : 'None'
-      });
-    } else if (!userCatalog.showInHome) {
-      catalog.extra.unshift({
-        name: "genre",
-        options: ["None"],
-        isRequired: true,
-        default: "None"
-      });
-    }
 
     logger.debug(`Simkl catalog created successfully: ${catalog.id}`);
     return catalog;
@@ -731,30 +811,89 @@ async function createSimklCatalog(userCatalog: any, showPrefix: boolean = false,
   }
 }
 
-async function getManifest(config: any, opts: { tag?: string } = {}): Promise<any> {
+/** Every tag a config knows about, lowercase name to the casing it is stored under. */
+function knownTagNames(config: any): Map<string, string> {
+  const known = new Map<string, string>();
+  const add = (value: any) => {
+    const name = typeof value === 'string' ? value : value?.name;
+    if (name) known.set(String(name).toLowerCase(), String(name));
+  };
+  for (const tag of (Array.isArray(config?.tags) ? config.tags : [])) add(tag);
+  for (const catalog of (Array.isArray(config?.catalogs) ? config.catalogs : [])) {
+    for (const tag of (Array.isArray(catalog?.tags) ? catalog.tags : [])) add(tag);
+  }
+  return known;
+}
+
+/**
+ * A tag name may contain any character, so no separator is safe on its own. A value
+ * that names a real tag is taken whole, otherwise it is split on commas, and only
+ * then on spaces, which a raw "+" in a query string decodes to. That last split is a
+ * guess, so it is kept only when every piece names a real tag.
+ */
+function expandTagValue(value: string, known: Map<string, string>): string[] {
+  if (!value) return [];
+  if (known.has(value.toLowerCase())) return [value];
+
+  if (value.includes(',')) {
+    return value.split(',').flatMap((part) => expandTagValue(part.trim(), known));
+  }
+
+  const spaced = value.split(/\s+/).filter(Boolean);
+  if (spaced.length > 1 && spaced.every((part) => known.has(part.toLowerCase()))) return spaced;
+
+  return [value];
+}
+
+/**
+ * Turns whatever arrived as ?tag= into the profiles to build. Repeated params come
+ * through as an array, so they are handled alongside the single-value forms. Tags
+ * that match nothing are reported rather than dropped, since an install URL naming a
+ * renamed tag would otherwise serve a near-empty manifest without saying why.
+ */
+function resolveManifestTags(config: any, raw: unknown): { tags: string[]; unknown: string[] } {
+  const known = knownTagNames(config);
+  const values = (raw === undefined || raw === null ? [] : Array.isArray(raw) ? raw : [raw])
+    .filter((value: any) => typeof value === 'string')
+    .flatMap((value: string) => expandTagValue(value.trim(), known));
+
+  const tags: string[] = [];
+  const unknown: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const lower = value.toLowerCase();
+    if (!value || seen.has(lower)) continue;
+    seen.add(lower);
+    const stored = known.get(lower);
+    tags.push(stored || value);
+    if (!stored) unknown.push(value);
+  }
+  return { tags, unknown };
+}
+
+/** Long selections would run off the end of a client's addon list. */
+function formatTagSuffix(tags: string[]): string {
+  if (tags.length <= 3) return tags.join(' + ');
+  return `${tags.slice(0, 2).join(' + ')} +${tags.length - 2} more`;
+}
+
+async function getManifest(config: any, opts: { tags?: string[] } = {}): Promise<any> {
   const startTime = Date.now();
   logger.start('Starting manifest generation...');
 
     const language = config.language || DEFAULT_LANGUAGE;
     const showPrefix = config.showPrefix === true;
     const prefixName = config.addonName || "AIOMetadata";
-    const provideImdbId = config.provideImdbId === "true";
-    const sessionId = config.sessionId;
     const userCatalogs = config.catalogs || getDefaultCatalogs();
     const translatedCatalogs = loadTranslations(language);
 
-  const tag = (opts.tag || '').trim();
-  const tagLower = tag.toLowerCase();
+  // Already resolved to their stored casing by resolveManifestTags. A catalog carrying
+  // any one of them is in, so several profiles install as a single addon.
+  const tags = Array.isArray(opts.tags) ? opts.tags.filter(Boolean) : [];
+  const tagSet = new Set(tags.map((t: string) => t.toLowerCase()));
   const enabledCatalogs = userCatalogs.filter((c: any) =>
-    c.enabled && (!tag || (Array.isArray(c.tags) && c.tags.some((t: any) => String(t).toLowerCase() === tagLower)))
+    c.enabled && (tagSet.size === 0 || (Array.isArray(c.tags) && c.tags.some((t: any) => tagSet.has(String(t).toLowerCase()))))
   );
-
-  // Resolve the tag to its stored casing (install URLs may be hand-typed in any case).
-  const displayTag = tag
-    ? (enabledCatalogs
-        .flatMap((c: any) => (Array.isArray(c.tags) ? c.tags : []))
-        .find((t: any) => String(t).toLowerCase() === tagLower) || tag)
-    : tag;
 
   // Absorbed merge sources must be built (even if disabled) so their genres feed the parent.
   const mergedSourceKeys = new Set<string>();
@@ -796,7 +935,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
   }
 
   fetchPromises.push(
-    cacheWrapGlobal(`languages:${language}`, () => getLanguages(config), 60 * 60)
+    cacheWrapGlobal('languages:v2', () => getLanguages(config), 60 * 60)
   );
 
   const genreStart = Date.now();
@@ -824,7 +963,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
     const animeGenres = await cacheWrapJikanApi('anime-genres', async () => {
       logger.info('[Cache Miss] Fetching fresh anime genre list in manifest from Jikan...');
       return await jikan.getAnimeGenres();
-    }, null, { skipVersion: true });
+    }, null);
     animeGenreNames = animeGenres.filter(Boolean).map((genre: any) => genre.name).sort();
     logger.debug(`Anime genres fetched in ${Date.now() - animeStart}ms`);
 
@@ -834,7 +973,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
         const studioPromise = cacheWrapJikanApi('mal-studios', async () => {
           logger.debug('[Cache Miss] Fetching fresh anime studio list in manifest from Jikan...');
           return await jikan.getStudios();
-        }, 30 * 24 * 60 * 60, { skipVersion: true });
+        }, 30 * 24 * 60 * 60);
 
         const timeoutPromise = new Promise((_: any, reject: any) => {
           setTimeout(() => reject(new Error('Studio fetch timeout')), 2000);
@@ -859,7 +998,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
         const seasonsData = await cacheWrapJikanApi('mal-available-seasons', async () => {
           logger.debug('[Cache Miss] Fetching available seasons from Jikan...');
           return await jikan.getAvailableSeasons();
-        }, 7 * 24 * 60 * 60, { skipVersion: true });
+        }, 7 * 24 * 60 * 60);
 
         const seasonNames = ['Winter', 'Spring', 'Summer', 'Fall'];
         const seasonOrder: Record<string, number> = { winter: 0, spring: 1, summer: 2, fall: 3 };
@@ -953,16 +1092,28 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
       if (isSimkl(userCatalog.id)) {
         return true;
       }
+      if (userCatalog.id.startsWith('movielens.')) {
+        return !!config.apiKeys?.movieLensCredId;
+      }
       if (userCatalog.id.startsWith('tmdb.list.')) {
         return true;
       }
       if (userCatalog.id.startsWith('tmdb.discover.')) {
         return true;
       }
+      if (userCatalog.id.startsWith('tmdb.collection.')) {
+        return true;
+      }
       if (userCatalog.id.startsWith('tvdb.discover.')) {
         return true;
       }
+      if (userCatalog.id.startsWith('tvdb.list.')) {
+        return true;
+      }
       if (userCatalog.id.startsWith('mal.discover.')) {
+        return true;
+      }
+      if (userCatalog.id.startsWith('mal.userlist.') || userCatalog.id === 'mal.suggestions') {
         return true;
       }
       if (userCatalog.id.startsWith('stremthru.')) {
@@ -1010,6 +1161,26 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
           logger.debug(`Simkl catalog result:`, result ? 'success' : 'failed');
           return result;
       }
+      if (userCatalog.id.startsWith('movielens.')) {
+          logger.debug(`Processing MovieLens catalog: ${userCatalog.id}`);
+          const catalogType = userCatalog.displayType || userCatalog.type;
+          const supportsGenres = userCatalog.id.startsWith('movielens.explore') || userCatalog.id.startsWith('movielens.watchlist');
+          const genreOptions = supportsGenres ? MOVIELENS_GENRES : [];
+          const options = userCatalog.showInHome ? genreOptions : ['None', ...genreOptions];
+          const extra: any[] = [];
+          if (options.length > 0) {
+            extra.push({ name: 'genre', options, isRequired: !userCatalog.showInHome });
+          }
+          extra.push({ name: 'skip' });
+          return {
+            id: userCatalog.id,
+            type: catalogType,
+            name: `${showPrefix ? `${prefixName} - ` : ""}${userCatalog.name}`,
+            pageSize: parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20,
+            extra,
+            showInHome: userCatalog.showInHome
+          };
+      }
       if (isPublicMetaDB(userCatalog.id)) {
           logger.debug(`Processing PublicMetaDB catalog: ${userCatalog.id}`);
           const result = createPublicMetaDBCatalog(userCatalog, showPrefix, prefixName);
@@ -1019,6 +1190,12 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
           logger.debug(`Processing TMDB List catalog: ${userCatalog.id}`);
           const result = await createTMDBListCatalog(userCatalog, genres_movie_names, genres_series_names, showPrefix, prefixName);
           logger.debug(`TMDB List catalog result:`, result ? 'success' : 'failed');
+          return result;
+      }
+      if (userCatalog.id.startsWith('tmdb.collection.')) {
+          logger.debug(`Processing TMDB Collection catalog: ${userCatalog.id}`);
+          const result = createTMDBCollectionCatalog(userCatalog, genres_movie_names, showPrefix, prefixName);
+          logger.debug(`TMDB Collection catalog result:`, result ? 'success' : 'failed');
           return result;
       }
       if (userCatalog.id.startsWith('tmdb.discover.')) {
@@ -1031,6 +1208,12 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
           logger.debug(`Processing TVDB Discover catalog: ${userCatalog.id}`);
           const result = createTVDBDiscoverCatalog(userCatalog, genres_tvdb_all_names, showPrefix, prefixName);
           logger.debug(`TVDB Discover catalog result:`, result ? 'success' : 'failed');
+          return result;
+      }
+      if (userCatalog.id.startsWith('tvdb.list.')) {
+          logger.debug(`Processing TVDB List catalog: ${userCatalog.id}`);
+          const result = createTVDBListCatalog(userCatalog, showPrefix, prefixName);
+          logger.debug(`TVDB List catalog result:`, result ? 'success' : 'failed');
           return result;
       }
       if (userCatalog.id.startsWith('stremthru.')) {
@@ -1051,9 +1234,13 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
       }
       if(userCatalog.id.startsWith('mal.discover')){
         logger.debug(`Processing mal discover catalog: ${userCatalog.id}`);
-        const result = await createMalCatalog(userCatalog, animeGenreNames, showPrefix, prefixName);
+        const result = await createMalCatalog(userCatalog, animeGenreNames, showPrefix);
         logger.debug(`Mal discover catalog result:`, result ? 'success' : 'failed');
         return result;
+      }
+      if (userCatalog.id.startsWith('mal.userlist.') || userCatalog.id === 'mal.suggestions') {
+        logger.debug(`Processing MAL user list catalog: ${userCatalog.id}`);
+        return createMalUserListCatalog(userCatalog, showPrefix, prefixName);
       }
       if (userCatalog.id.startsWith('letterboxd.')) {
           logger.debug(`Processing Letterboxd catalog: ${userCatalog.id}`);
@@ -1142,14 +1329,15 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
       else if (userCatalog.id === 'mal.airing' || userCatalog.id === 'mal.upcoming' ||
                userCatalog.id === 'mal.top_movies' || userCatalog.id === 'mal.top_series' ||
                userCatalog.id === 'mal.most_favorites' || userCatalog.id === 'mal.most_popular' ||
-               userCatalog.id === 'mal.top_anime') {
+               userCatalog.id === 'mal.top_anime' ||
+               userCatalog.id === 'mal.season_top' || userCatalog.id === 'mal.season_top_new') {
         catalogOptions = ['None'];
       }
-      else if (userCatalog.id.startsWith('mal.') && !['mal.airing', 'mal.upcoming', 'mal.schedule', 'mal.seasons', 'mal.top_movies', 'mal.top_series', 'mal.most_favorites', 'mal.top_anime', 'mal.most_popular'].includes(userCatalog.id)) {
+      else if (userCatalog.id.startsWith('mal.') && !['mal.airing', 'mal.upcoming', 'mal.schedule', 'mal.seasons', 'mal.top_movies', 'mal.top_series', 'mal.most_favorites', 'mal.top_anime', 'mal.most_popular', 'mal.season_top', 'mal.season_top_new'].includes(userCatalog.id)) {
         catalogOptions = userCatalog.showInHome ? animeGenreNames : ['None', ...animeGenreNames];
       }
       else {
-        catalogOptions = getOptionsForCatalog(catalogDef, userCatalog.type, userCatalog.showInHome, options);
+        catalogOptions = getOptionsForCatalog(catalogDef, userCatalog.type, options);
         if ((userCatalog.id.startsWith('streaming.') || userCatalog.id.startsWith('tmdb.top') || userCatalog.id.startsWith('tmdb.top_rated') || userCatalog.id.startsWith('tmdb.airing_today')) && userCatalog.showInHome === false) {
           catalogOptions = ['None', ...catalogOptions];
         }
@@ -1224,6 +1412,24 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
   }
 
 
+  // Several branches prepend "None" to the genre list for catalogs that are not
+  // on home, and some providers ship a genre of their own literally called
+  // "None" (Trakt shows, for one), so the option can end up listed twice.
+  // Deduplicate once here rather than in every branch that builds options.
+  for (const catalog of catalogs as any[]) {
+    if (!Array.isArray(catalog?.extra)) continue;
+    for (const extra of catalog.extra) {
+      if (extra?.name !== 'genre' || !Array.isArray(extra.options)) continue;
+      const seen = new Set<string>();
+      extra.options = extra.options.filter((option: any) => {
+        const key = String(option);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+  }
+
   const isSearchEnabled = config.search?.enabled ?? true;
   const engineEnabled = config.search?.engineEnabled || {};
   const searchProviders = config.search?.providers || {};
@@ -1257,7 +1463,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
     return searchNameMap[searchId] || searchId;
   };
 
-  const getSearchCatalogName = (searchId: string, prefix: string = '', suffix: string = 'Search'): string => {
+  const getSearchCatalogName = (searchId: string, prefix: string = ''): string => {
     const customName = searchNames[searchId];
     if (customName) {
       return `${prefix}${customName}`;
@@ -1350,7 +1556,7 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
         id: 'gemini.search',
         type: 'other',
         provider: 'gemini.search',
-        enabled: engineEnabled['gemini.search'] !== false && config.search?.ai_enabled === true && (!!config.apiKeys?.gemini || !!config.apiKeys?.openrouter),
+        enabled: engineEnabled['gemini.search'] !== false && config.search?.ai_enabled === true && (!!config.apiKeys?.gemini || !!config.apiKeys?.openrouter || !!process.env.BUILT_IN_GEMINI_API_KEY),
         suffix: 'AI Search'
       }
     ];
@@ -1376,12 +1582,12 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
         catalogs.push({
           id: catalogId,
           type: getSearchCatalogType(config.id, config.type),
-          name: getSearchCatalogName(config.id, prefix, config.suffix),
+          name: getSearchCatalogName(config.id, prefix),
           extra: [{ name: 'search', isRequired: true }, { name: 'skip' }]
         });
       });
     const isMalSearchInUse = Object.entries(searchProviders).some(
-      ([key, providerId]: [string, any]) =>
+      ([, providerId]: [string, any]) =>
         typeof providerId === 'string' &&
         providerId.startsWith('mal.search') &&
         engineEnabled[providerId] !== false
@@ -1403,35 +1609,26 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
     }
   }
 
-  catalogs.push({
-    type: "series",
-    id: "calendar-videos",
-    extra: [
-      {
-        name: "calendarVideosIds",
-        isRequired: true,
-        optionsLimit: 100
-      }
-    ],
-    extraSupported: [
-      "calendarVideosIds"
-    ],
-    extraRequired: [
-      "calendarVideosIds"
-    ],
-    name: "Calendar videos"
-  });
-
-  const activeConfigs = [
-    `Language: ${language}`,
-    `TMDB Account: ${sessionId ? 'Connected' : 'Not Connected'}`,
-    `MDBList Integration: ${config.apiKeys?.mdblist ? 'Connected' : 'Not Connected'}`,
-    `IMDb Integration: ${provideImdbId ? 'Enabled' : 'Disabled'}`,
-    `RPDB Integration: ${config.apiKeys?.rpdb } ? 'Enabled' : 'Disabled'}`,
-    `Search: ${config.searchEnabled !== "false" ? 'Enabled' : 'Disabled'}`,
-    `Active Catalogs: ${catalogs.length}`
-  ].join(' | ');
-
+  if (!config.hideStremioCatalogs) {
+    catalogs.push({
+      type: "series",
+      id: "calendar-videos",
+      extra: [
+        {
+          name: "calendarVideosIds",
+          isRequired: true,
+          optionsLimit: 100
+        }
+      ],
+      extraSupported: [
+        "calendarVideosIds"
+      ],
+      extraRequired: [
+        "calendarVideosIds"
+      ],
+      name: "Calendar videos"
+    });
+  }
 
   const nameSuffix = process.env.ADDON_NAME_SUFFIX || "";
   const baseName = config.addonName || (nameSuffix ? `AIOMetadata ${nameSuffix}` : "AIOMetadata");
@@ -1441,7 +1638,10 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
   if (!config.catalogModeOnly) {
     resources.push("meta");
   }
-  resources.push("subtitles");
+  const watchTrackingEnabled = hasAnyWatchTrackingEnabled(config);
+  if (watchTrackingEnabled) {
+    resources.push("subtitles");
+  }
   if(config.showRateMeButton) {
     resources.push("stream");
   }
@@ -1451,11 +1651,11 @@ async function getManifest(config: any, opts: { tag?: string } = {}): Promise<an
     version: buildInfo.version,
     logo: manifestLogoUrl(),
     background: `${host}/background.png`,
-    name: tag ? `${addonName} · ${displayTag}` : addonName,
+    name: tags.length > 0 ? `${addonName} · ${formatTagSuffix(tags)}` : addonName,
     description: "A metadata addon for power users. AIOMetadata uses TMDB, TVDB, TVMaze, MyAnimeList, IMDB and Fanart.tv to provide accurate data for movies, series, and anime. You choose the source.",
     resources,
     types: ["movie", "series", "anime.movie", "anime.series", "anime", "Trakt", "collection"],
-    idPrefixes: ["tmdb:", "tt", "tvdb:", "mal:", "tvmaze:", "kitsu:", "anidb:", "anilist:", "tvdbc:", "upnext_", "unwatched_", "mdblist_upnext_", "pmdb_resume_"],
+    idPrefixes: ["tmdb:", "tt", "tvdb:", "mal:", "tvmaze:", "kitsu:", "anidb:", "anilist:", "tvdbc:", "upnext_", "unwatched_", "mdblist_upnext_", "pmdb_resume_", "simkl_upnext_"],
     stremioAddonsConfig: {
       "issuer": "https://stremio-addons.net",
       "signature": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..3_iKJ-pKhR-LclfTPxvyag.uY747PgjymdL0OMdZrE7HTOVG-8nNWC-LrlJ5tCXm2i2FioXv_ismzWV0_XsLl0Me9cW9D3xog6d4tSHDY8Pe27mbIylUb61MS4VVqg_sFZXUVon2le-fRFrtmMnIqCF.oyYRDftPN2sohMpDMbMbYg"
@@ -1519,5 +1719,5 @@ function getDefaultCatalogs(): any[] {
   return [...tmdbCatalogs, ...tvdbCatalogs, ...malCatalogs, ...streamingCatalogs];
 }
 
-export { getManifest, DEFAULT_LANGUAGE };
-module.exports = { getManifest, DEFAULT_LANGUAGE };
+export { getManifest, resolveManifestTags, DEFAULT_LANGUAGE };
+module.exports = { getManifest, resolveManifestTags, DEFAULT_LANGUAGE };

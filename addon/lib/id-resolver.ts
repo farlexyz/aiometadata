@@ -293,7 +293,7 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
       if (allIds.tmdbId && (type === 'movie' || type === 'series')) {
         wikiMapping = mappings.getByTmdbId(allIds.tmdbId.toString(), type);
       } else if (allIds.tvdbId && (type === 'movie' || type === 'series')) {
-        wikiMapping = mappings.getByTvdbId(allIds.tvdbId.toString());
+        wikiMapping = mappings.getByTvdbId(allIds.tvdbId.toString(), type);
       } else if (allIds.imdbId && (type === 'movie' || type === 'series')) {
         wikiMapping = mappings.getByImdbId(allIds.imdbId, type);
       } else if (allIds.tvmazeId && type === 'series') {
@@ -408,7 +408,7 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
       primaryPromises.push(_fetchFromTmdb(allIds.tmdbId, type, config));
     }
 
-    if (allIds.tvmazeId && ((needsImdb && !allIds.imdbId) || (needsTmdb && !allIds.tmdbId) || (needsTvdb && !allIds.tvdbId))) {
+    if (allIds.tvmazeId && type === 'series' && ((needsImdb && !allIds.imdbId) || (needsTmdb && !allIds.tmdbId) || (needsTvdb && !allIds.tvdbId))) {
       logger.debug(`[Primary API] TVMaze externals - needs: imdb=${needsImdb && !allIds.imdbId}, tmdb=${needsTmdb && !allIds.tmdbId}, tvdb=${needsTvdb && !allIds.tvdbId}`);
       primaryPromises.push(_fetchFromTvmaze(allIds.tvmazeId, config));
     }
@@ -475,7 +475,7 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
             tvdb.findByImdbId(allIds.imdbId, config)
                 .then((res: any) => {
                     const duration = Date.now() - tvdbFindStartTime;
-                    const tvdbId = (type === 'movie' ? res?.[0]?.movie?.id : res?.[0]?.series?.id) || null;
+                    const tvdbId = tvdb.tvdbIdFromRemoteIdResults(res, type);
                     secondaryTimings.push({
                         operation: 'tvdb_find_by_imdb',
                         duration,
@@ -509,9 +509,7 @@ async function resolveAllIds(stremioId: string, type: string, config: any, prefe
             tvdb.findByTmdbId(allIds.tmdbId, config)
                 .then((res: any) => {
                     const duration = Date.now() - tvdbFindTmdbStartTime;
-                    const movieResult = res?.find((r: any) => r.movie);
-                    const seriesResult = res?.find((r: any) => r.series);
-                    const tvdbId = (type === 'movie' ? movieResult?.movie?.id : seriesResult?.series?.id) || null;
+                    const tvdbId = tvdb.tvdbIdFromRemoteIdResults(res, type);
                     secondaryTimings.push({
                         operation: 'tvdb_find_by_tmdb',
                         duration,

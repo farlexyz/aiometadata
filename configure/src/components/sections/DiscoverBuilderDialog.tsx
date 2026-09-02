@@ -13,6 +13,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { AlertCircle, AlertTriangle, CircleHelp, Loader2, Search, Trash2, Wand2, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiCache } from '@/utils/apiCache';
+import { CacheTTLField } from '@/components/CacheTTLField';
+import { resolveCatalogTTL } from '@/lib/catalogTTL';
 
 interface DiscoverBuilderDialogProps {
   isOpen: boolean;
@@ -30,10 +32,11 @@ type CatalogMediaType = 'movie' | 'series';
 type TmdbMediaType = 'movie' | 'tv';
 type DiscoverSource = 'tmdb' | 'tvdb' | 'anilist' | 'simkl' | 'mal' | 'mdblist';
 type SimklDiscoverMediaType = 'movies' | 'shows' | 'anime';
-type SearchEntity = 'person' | 'company' | 'keyword';
+type SearchEntity = 'person' | 'company' | 'keyword' | 'network';
 type JoinMode = 'or' | 'and';
 type DatePresetKey =
   | 'today'
+  | 'this_week'
   | 'this_month'
   | 'last_month'
   | 'this_year'
@@ -48,6 +51,7 @@ type DatePresetKey =
   | 'custom';
 type RelativeDatePresetKey =
   | 'today'
+  | 'this_week'
   | 'this_month'
   | 'last_month'
   | 'this_year'
@@ -126,10 +130,16 @@ const MOVIE_SORT_OPTIONS = [
   { value: 'popularity.asc', label: 'Popularity (Low to High)' },
   { value: 'primary_release_date.desc', label: 'Release Date (Newest)' },
   { value: 'primary_release_date.asc', label: 'Release Date (Oldest)' },
+  { value: 'title.asc', label: 'Title (A-Z)' },
+  { value: 'title.desc', label: 'Title (Z-A)' },
+  { value: 'original_title.asc', label: 'Original Title (A-Z)' },
+  { value: 'original_title.desc', label: 'Original Title (Z-A)' },
   { value: 'vote_average.desc', label: 'User Score (Highest)' },
   { value: 'vote_average.asc', label: 'User Score (Lowest)' },
   { value: 'vote_count.desc', label: 'Vote Count (Highest)' },
+  { value: 'vote_count.asc', label: 'Vote Count (Lowest)' },
   { value: 'revenue.desc', label: 'Revenue (Highest)' },
+  { value: 'revenue.asc', label: 'Revenue (Lowest)' },
 ] as const;
 
 const TV_SORT_OPTIONS = [
@@ -137,9 +147,14 @@ const TV_SORT_OPTIONS = [
   { value: 'popularity.asc', label: 'Popularity (Low to High)' },
   { value: 'first_air_date.desc', label: 'First Air Date (Newest)' },
   { value: 'first_air_date.asc', label: 'First Air Date (Oldest)' },
+  { value: 'name.asc', label: 'Name (A-Z)' },
+  { value: 'name.desc', label: 'Name (Z-A)' },
+  { value: 'original_name.asc', label: 'Original Name (A-Z)' },
+  { value: 'original_name.desc', label: 'Original Name (Z-A)' },
   { value: 'vote_average.desc', label: 'User Score (Highest)' },
   { value: 'vote_average.asc', label: 'User Score (Lowest)' },
   { value: 'vote_count.desc', label: 'Vote Count (Highest)' },
+  { value: 'vote_count.asc', label: 'Vote Count (Lowest)' },
 ] as const;
 
 const TMDB_TV_STATUS_OPTIONS = [
@@ -149,6 +164,25 @@ const TMDB_TV_STATUS_OPTIONS = [
   { value: '3', label: 'Ended' },
   { value: '4', label: 'Cancelled' },
   { value: '5', label: 'Pilot' },
+] as const;
+
+const TMDB_TV_TYPE_OPTIONS = [
+  { value: '0', label: 'Documentary' },
+  { value: '1', label: 'News' },
+  { value: '2', label: 'Miniseries' },
+  { value: '3', label: 'Reality' },
+  { value: '4', label: 'Scripted' },
+  { value: '5', label: 'Talk Show' },
+  { value: '6', label: 'Video' },
+] as const;
+
+const TMDB_MOVIE_RELEASE_TYPE_OPTIONS = [
+  { value: '1', label: 'Premiere' },
+  { value: '2', label: 'Theatrical (limited)' },
+  { value: '3', label: 'Theatrical' },
+  { value: '4', label: 'Digital' },
+  { value: '5', label: 'Physical' },
+  { value: '6', label: 'TV' },
 ] as const;
 
 const TVDB_MOVIE_SORT_OPTIONS = [
@@ -175,10 +209,12 @@ const JOIN_MODE_OPTIONS = [
 ];
 
 const DATE_PRESET_OPTIONS: Array<{ value: Exclude<DatePresetKey, 'custom'>; label: string }> = [
+  { value: 'today', label: 'Today' },
+  { value: 'this_week', label: 'This Week' },
   { value: 'this_month', label: 'This Month' },
-  { value: 'last_month', label: 'Last Month' },
+  { value: 'last_month', label: 'Last 30 Days' },
   { value: 'this_year', label: 'This Year' },
-  { value: 'last_year', label: 'Last Year' },
+  { value: 'last_year', label: 'Last 12 Months' },
   { value: 'last_5_years', label: 'Last 5 Years' },
   { value: 'last_10_years', label: 'Last 10 Years' },
   { value: 'era_2010s', label: '2010s' },
@@ -190,6 +226,7 @@ const DATE_PRESET_OPTIONS: Array<{ value: Exclude<DatePresetKey, 'custom'>; labe
 
 const RELATIVE_DATE_PRESET_KEYS: RelativeDatePresetKey[] = [
   'today',
+  'this_week',
   'this_month',
   'last_month',
   'this_year',
@@ -523,6 +560,18 @@ function getDateRangeFromPreset(preset: Exclude<DatePresetKey, 'custom'>): { fro
   const fromDate = new Date(now);
 
   switch (preset) {
+    case 'today':
+      return { from: to, to };
+    case 'this_week': {
+      const monday = new Date(now);
+      monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+      const sunday = new Date(monday);
+      sunday.setDate(sunday.getDate() + 6);
+      return {
+        from: formatLocalDateForInput(monday),
+        to: formatLocalDateForInput(sunday),
+      };
+    }
     case 'this_month': {
       const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
       const lastOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
@@ -572,7 +621,9 @@ function applyDynamicTmdbDateTokens(
   catalogType: CatalogMediaType,
   movieDatePreset: DatePresetKey,
   seriesDatePreset: DatePresetKey,
-  releasedOnly: boolean
+  airDatePreset: DatePresetKey,
+  releasedOnly: boolean,
+  movieReleaseTypesSelected: boolean = false
 ): Record<string, string | number | boolean> {
   const serializedParams = { ...params };
 
@@ -583,11 +634,28 @@ function applyDynamicTmdbDateTokens(
   if (catalogType === 'movie' && isRelativeDatePreset(movieDatePreset)) {
     serializedParams['primary_release_date.gte'] = buildTmdbDateToken(movieDatePreset, 'from');
     serializedParams['primary_release_date.lte'] = buildTmdbDateToken(movieDatePreset, 'to');
+    if (movieReleaseTypesSelected) {
+      serializedParams['release_date.gte'] = buildTmdbDateToken(movieDatePreset, 'from');
+      serializedParams['release_date.lte'] = buildTmdbDateToken(movieDatePreset, 'to');
+    }
+  } else if (
+    catalogType === 'movie'
+    && movieReleaseTypesSelected
+    && !releasedOnly
+    && serializedParams['release_date.lte']
+    && !serializedParams['primary_release_date.lte']
+  ) {
+    serializedParams['release_date.lte'] = buildTmdbDateToken('today', 'to');
   }
 
   if (catalogType === 'series' && isRelativeDatePreset(seriesDatePreset)) {
     serializedParams['first_air_date.gte'] = buildTmdbDateToken(seriesDatePreset, 'from');
     serializedParams['first_air_date.lte'] = buildTmdbDateToken(seriesDatePreset, 'to');
+  }
+
+  if (catalogType === 'series' && isRelativeDatePreset(airDatePreset)) {
+    serializedParams['air_date.gte'] = buildTmdbDateToken(airDatePreset, 'from');
+    serializedParams['air_date.lte'] = buildTmdbDateToken(airDatePreset, 'to');
   }
 
   return serializedParams;
@@ -701,11 +769,12 @@ function LabelWithTooltip({
 }
 
 export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customizeTemplate }: DiscoverBuilderDialogProps) {
-  const { config, setConfig, catalogTTL, auth } = useConfig();
+  const { config, setConfig, catalogTTL, auth, hasBuiltInMdblist } = useConfig();
   const tmdbApiKey = config.apiKeys?.tmdb?.trim() || '';
   const tvdbApiKey = config.apiKeys?.tvdb?.trim() || '';
   const mdblistApiKey = config.apiKeys?.mdblist?.trim() || '';
-  const hasMdblistApiKey = mdblistApiKey.length > 0;
+  // Discover queries are not account-scoped, so the instance key covers them.
+  const hasMdblistApiKey = mdblistApiKey.length > 0 || hasBuiltInMdblist;
   const [simklClientId, setSimklClientId] = useState<string>("");
   
   useEffect(() => {
@@ -745,7 +814,9 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
   const [includeAdult, setIncludeAdult] = useState<boolean>(config.includeAdult);
   const [releasedOnly, setReleasedOnly] = useState<boolean>(false);
   const [tmdbTvStatuses, setTmdbTvStatuses] = useState<string[]>([]);
-  const [cacheTTL, setCacheTTL] = useState<number>(Math.max(catalogTTL, 300));
+  const [tmdbMovieReleaseTypes, setTmdbMovieReleaseTypes] = useState<string[]>([]);
+  const [tmdbTvTypes, setTmdbTvTypes] = useState<string[]>([]);
+  const [cacheTTL, setCacheTTL] = useState<number | null>(null);
 
   const [references, setReferences] = useState<TmdbDiscoverReferenceResponse | null>(null);
   const [isLoadingReferences, setIsLoadingReferences] = useState(false);
@@ -783,6 +854,11 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
   const [companyJoinMode, setCompanyJoinMode] = useState<JoinMode>('or');
   const [isSearchingCompanies, setIsSearchingCompanies] = useState(false);
 
+  const [networkQuery, setNetworkQuery] = useState('');
+  const [networkResults, setNetworkResults] = useState<TmdbEntityResult[]>([]);
+  const [withNetworks, setWithNetworks] = useState<SelectionItem[]>([]);
+  const [isSearchingNetworks, setIsSearchingNetworks] = useState(false);
+
   const [keywordQuery, setKeywordQuery] = useState('');
   const [keywordResults, setKeywordResults] = useState<TmdbEntityResult[]>([]);
   const [withKeywords, setWithKeywords] = useState<SelectionItem[]>([]);
@@ -794,6 +870,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
 
   const peopleSearchRef = useRef<HTMLDivElement | null>(null);
   const companySearchRef = useRef<HTMLDivElement | null>(null);
+  const networkSearchRef = useRef<HTMLDivElement | null>(null);
   const keywordSearchRef = useRef<HTMLDivElement | null>(null);
 
   const [voteAverageRange, setVoteAverageRange] = useState<[number, number]>([0, 10]);
@@ -808,6 +885,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
   const [seriesDatePreset, setSeriesDatePreset] = useState<DatePresetKey>('clear');
   const [airDateFrom, setAirDateFrom] = useState('');
   const [airDateTo, setAirDateTo] = useState('');
+  const [airDatePreset, setAirDatePreset] = useState<DatePresetKey>('clear');
 
   // AniList-specific state
   const [anilistFormats, setAnilistFormats] = useState<string[]>([]); // multi-select
@@ -962,6 +1040,14 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     [references]
   );
 
+  const defaultRegionFromLanguage = useMemo(() => {
+    const code = (config.language || 'en-US').split('-')[1]?.toUpperCase();
+    if (!code) return '';
+    const known = (references?.countries || []).some(c => c.iso_3166_1?.toUpperCase() === code)
+      || (references?.watchRegions || []).some(r => r.iso_3166_1?.toUpperCase() === code);
+    return known ? code : '';
+  }, [config.language, references]);
+
   const certificationOptions = useMemo(() => {
     if (!references || !certificationCountry) return [];
     const values = references.certifications?.[certificationCountry] || [];
@@ -1020,6 +1106,8 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     includeAdult,
     releasedOnly,
     tmdbTvStatuses,
+    tmdbMovieReleaseTypes,
+    tmdbTvTypes,
     includeGenres,
     excludeGenres,
     genreJoinMode,
@@ -1034,6 +1122,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     withCompanies,
     withoutCompanies,
     companyJoinMode,
+    withNetworks,
     withKeywords,
     withoutKeywords,
     keywordJoinMode,
@@ -1134,7 +1223,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     setIncludeAdult(config.includeAdult);
     setReleasedOnly(false);
     setTmdbTvStatuses([]);
-    setCacheTTL(Math.max(catalogTTL, 300));
+    setCacheTTL(null);
 
     setReferences(null);
     setIncludeGenres([]);
@@ -1165,6 +1254,10 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     setWithCompanies([]);
     setWithoutCompanies([]);
     setCompanyJoinMode('or');
+
+    setNetworkQuery('');
+    setNetworkResults([]);
+    setWithNetworks([]);
 
     setKeywordQuery('');
     setKeywordResults([]);
@@ -1264,7 +1357,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     if (fs.catalogName) setCatalogName(fs.catalogName);
     if (fs.discoverSource) setDiscoverSource(fs.discoverSource);
     if (fs.sortBy) setSortBy(fs.sortBy);
-    if (fs.cacheTTL) setCacheTTL(fs.cacheTTL);
+    setCacheTTL(fs.cacheTTL ?? null);
     if (fs.catalogType) setCatalogType(fs.catalogType);
   
     // TMDB / TVDB shared
@@ -1281,11 +1374,14 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     if (typeof fs.includeAdult === 'boolean') setIncludeAdult(fs.includeAdult);
     if (typeof fs.releasedOnly === 'boolean') setReleasedOnly(fs.releasedOnly);
     if (fs.tmdbTvStatuses) setTmdbTvStatuses(fs.tmdbTvStatuses);
+    if (fs.tmdbMovieReleaseTypes) setTmdbMovieReleaseTypes(fs.tmdbMovieReleaseTypes);
+    if (fs.tmdbTvTypes) setTmdbTvTypes(fs.tmdbTvTypes);
     if (fs.selectedPeople) setSelectedPeople(fs.selectedPeople);
     if (fs.peopleJoinMode) setPeopleJoinMode(fs.peopleJoinMode);
     if (fs.withCompanies) setWithCompanies(fs.withCompanies);
     if (fs.withoutCompanies) setWithoutCompanies(fs.withoutCompanies);
     if (fs.companyJoinMode) setCompanyJoinMode(fs.companyJoinMode);
+    if (fs.withNetworks) setWithNetworks(fs.withNetworks);
     if (fs.withKeywords) setWithKeywords(fs.withKeywords);
     if (fs.withoutKeywords) setWithoutKeywords(fs.withoutKeywords);
     if (fs.keywordJoinMode) setKeywordJoinMode(fs.keywordJoinMode);
@@ -1325,6 +1421,17 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     }
     if (fs.airDateFrom) setAirDateFrom(fs.airDateFrom);
     if (fs.airDateTo) setAirDateTo(fs.airDateTo);
+    const loadedAirDatePreset = fs.airDatePreset as DatePresetKey | undefined;
+    if (loadedAirDatePreset) {
+      setAirDatePreset(loadedAirDatePreset);
+      if (loadedAirDatePreset !== 'custom') {
+        const { from, to } = getDateRangeFromPreset(loadedAirDatePreset);
+        setAirDateFrom(from);
+        setAirDateTo(to);
+      }
+    } else if (fs.airDateFrom || fs.airDateTo) {
+      setAirDatePreset('custom');
+    }
     if (fs.releaseRegion) setReleaseRegion(fs.releaseRegion);
   
     // TVDB-only
@@ -1407,6 +1514,8 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     if (typeof fs.includeAdult === 'boolean') setIncludeAdult(fs.includeAdult);
     if (typeof fs.releasedOnly === 'boolean') setReleasedOnly(fs.releasedOnly);
     if (fs.tmdbTvStatuses) setTmdbTvStatuses(fs.tmdbTvStatuses);
+    if (fs.tmdbMovieReleaseTypes) setTmdbMovieReleaseTypes(fs.tmdbMovieReleaseTypes);
+    if (fs.tmdbTvTypes) setTmdbTvTypes(fs.tmdbTvTypes);
     if (typeof fs.voteCountMin === 'number') setVoteCountMin(fs.voteCountMin);
     if (fs.voteAverageRange) setVoteAverageRange(fs.voteAverageRange);
     if (fs.runtimeRange) setRuntimeRange(fs.runtimeRange);
@@ -1418,7 +1527,8 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     if (fs.firstAirTo) setFirstAirTo(fs.firstAirTo);
     if (fs.airDateFrom) setAirDateFrom(fs.airDateFrom);
     if (fs.airDateTo) setAirDateTo(fs.airDateTo);
-  
+    if (fs.airDatePreset) setAirDatePreset(fs.airDatePreset as DatePresetKey);
+
     // TVDB fields
     if (fs.tvdbSortDirection) setTvdbSortDirection(fs.tvdbSortDirection);
     if (fs.tvdbStatus) setTvdbStatus(fs.tvdbStatus);
@@ -1518,6 +1628,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
       const clickedInsideSearch =
         peopleSearchRef.current?.contains(target) ||
         companySearchRef.current?.contains(target) ||
+        networkSearchRef.current?.contains(target) ||
         keywordSearchRef.current?.contains(target);
 
       if (!clickedInsideSearch) {
@@ -2216,6 +2327,10 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
       params.without_companies = joinSelectionValues(withoutCompanies, companyJoinMode);
     }
 
+    if (catalogType === 'series' && withNetworks.length > 0) {
+      params.with_networks = joinSelectionValues(withNetworks, 'or');
+    }
+
     if (withKeywords.length > 0) {
       params.with_keywords = joinSelectionValues(withKeywords, keywordJoinMode);
     }
@@ -2231,12 +2346,32 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
       params.with_watch_monetization_types = 'flatrate|free|ads|rent|buy';
     }
 
-    if (catalogType === 'movie' && releaseRegion) {
-      params.region = releaseRegion;
+    const usesReleaseType = catalogType === 'movie' && (tmdbMovieReleaseTypes.length > 0 || releasedOnly);
+    // With no region the type matches a release in any country.
+    const effectiveReleaseRegion = catalogType === 'movie'
+      ? (releaseRegion || (usesReleaseType ? (watchRegion || defaultRegionFromLanguage) : ''))
+      : '';
+    if (effectiveReleaseRegion) {
+      params.region = effectiveReleaseRegion;
     }
-    if (catalogType === 'movie' && releasedOnly) {
+    if (catalogType === 'movie' && tmdbMovieReleaseTypes.length > 0) {
+      params.with_release_type = TMDB_MOVIE_RELEASE_TYPE_OPTIONS
+        .filter(option => tmdbMovieReleaseTypes.includes(option.value))
+        .map(option => option.value)
+        .join('|');
+    } else if (catalogType === 'movie' && releasedOnly) {
       params.with_release_type = '4|5|6';
       params['release_date.lte'] = getTodayLocalDateString();
+    }
+    // Only release_date follows with_release_type; primary_release_date ignores it.
+    if (usesReleaseType && typeof params.sort_by === 'string' && params.sort_by.startsWith('primary_release_date.')) {
+      params.sort_by = params.sort_by.replace('primary_release_date.', 'release_date.');
+    }
+    if (catalogType === 'series' && tmdbTvTypes.length > 0) {
+      params.with_type = TMDB_TV_TYPE_OPTIONS
+        .filter(option => tmdbTvTypes.includes(option.value))
+        .map(option => option.value)
+        .join('|');
     }
     if (catalogType === 'series' && tmdbTvStatuses.length > 0) {
       params.with_status = tmdbTvStatuses.join('|');
@@ -2266,6 +2401,14 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     if (catalogType === 'movie') {
       if (primaryReleaseFrom) params['primary_release_date.gte'] = primaryReleaseFrom;
       if (primaryReleaseTo) params['primary_release_date.lte'] = primaryReleaseTo;
+      if (tmdbMovieReleaseTypes.length > 0) {
+        if (primaryReleaseFrom || primaryReleaseTo) {
+          if (primaryReleaseFrom) params['release_date.gte'] = primaryReleaseFrom;
+          if (primaryReleaseTo) params['release_date.lte'] = primaryReleaseTo;
+        } else {
+          params['release_date.lte'] = getTodayLocalDateString();
+        }
+      }
     } else {
       if (firstAirFrom) params['first_air_date.gte'] = firstAirFrom;
       if (firstAirTo) params['first_air_date.lte'] = firstAirTo;
@@ -2306,11 +2449,14 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
         includeAdult,
         releasedOnly,
         tmdbTvStatuses,
+        tmdbMovieReleaseTypes,
+        tmdbTvTypes,
         selectedPeople,
         peopleJoinMode,
         withCompanies,
         withoutCompanies,
         companyJoinMode,
+        withNetworks,
         withKeywords,
         withoutKeywords,
         keywordJoinMode,
@@ -2328,6 +2474,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
         seriesDatePreset,
         airDateFrom,
         airDateTo,
+        airDatePreset,
         releaseRegion,
       });
     }
@@ -2435,13 +2582,20 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     setRuntimeRange(([currentMin]) => [currentMin, Math.max(value, currentMin)]);
   };
 
-  const applyDatePreset = (target: 'movie' | 'series', preset: Exclude<DatePresetKey, 'custom'>) => {
+  const applyDatePreset = (target: 'movie' | 'series' | 'airDate', preset: Exclude<DatePresetKey, 'custom'>) => {
     const { from, to } = getDateRangeFromPreset(preset);
 
     if (target === 'movie') {
       setPrimaryReleaseFrom(from);
       setPrimaryReleaseTo(to);
       setMovieDatePreset(preset);
+      return;
+    }
+
+    if (target === 'airDate') {
+      setAirDateFrom(from);
+      setAirDateTo(to);
+      setAirDatePreset(preset);
       return;
     }
 
@@ -2489,7 +2643,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
     try {
       const params = buildDiscoverParams();
       const persistedParams = discoverSource === 'tmdb'
-        ? applyDynamicTmdbDateTokens(params, catalogType, movieDatePreset, seriesDatePreset, releasedOnly)
+        ? applyDynamicTmdbDateTokens(params, catalogType, movieDatePreset, seriesDatePreset, airDatePreset, releasedOnly, tmdbMovieReleaseTypes.length > 0)
         : params;
       const formState = buildFormState();
   
@@ -2567,7 +2721,7 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
         enabled: editingCatalog?.enabled ?? true,
         showInHome: editingCatalog?.showInHome ?? true,
         source: discoverSource,
-        cacheTTL: Math.max(cacheTTL, 300),
+        cacheTTL: resolveCatalogTTL(cacheTTL, 300),
         // Preserve existing settings when editing
         ...(editingCatalog?.enableRatingPosters !== undefined && {
           enableRatingPosters: editingCatalog.enableRatingPosters
@@ -2575,6 +2729,8 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
         ...(editingCatalog?.randomizePerPage !== undefined && {
           randomizePerPage: editingCatalog.randomizePerPage
         }),
+        ...(editingCatalog?.tags?.length && { tags: editingCatalog.tags }),
+        ...(editingCatalog?.mergedInto && { mergedInto: editingCatalog.mergedInto }),
         ...(displayType && { displayType }),
         metadata: {
           description: `${sourceLabel} Discover (${discoverMediaType})`,
@@ -3478,20 +3634,13 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
                     </CardContent>
                   </Card>
                   )}
-                  <div className="space-y-2">
-                    <Label htmlFor="discover-cache-ttl">Cache TTL (seconds)</Label>
-                    <Input
-                      id="discover-cache-ttl"
-                      type="number"
-                      min={300}
-                      max={604800}
-                      value={cacheTTL}
-                      onChange={(event) => setCacheTTL(parseInt(event.target.value, 10) || catalogTTL)}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Minimum: 300 seconds (5 minutes)
-                    </p>
-                  </div>
+                  <CacheTTLField
+                    id="discover-cache-ttl"
+                    value={cacheTTL}
+                    onChange={setCacheTTL}
+                    min={300}
+                    help="Minimum: 300 seconds (5 minutes)"
+                  />
                 </div>
 
                 {discoverSource === 'tmdb' ? (
@@ -3526,6 +3675,43 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
                   </div>
                   {catalogType === 'series' && (
                     <div className="space-y-2">
+                      <LabelWithTooltip tooltip="Filter TV shows by what kind of show they are. Select multiple to include shows matching any of the chosen types.">
+                        Show Type
+                      </LabelWithTooltip>
+                      <div className="flex flex-wrap gap-2">
+                        {TMDB_TV_TYPE_OPTIONS.map(option => {
+                          const isSelected = tmdbTvTypes.includes(option.value);
+                          return (
+                            <Badge
+                              key={option.value}
+                              variant={isSelected ? 'default' : 'outline'}
+                              className="cursor-pointer select-none"
+                              onClick={() => {
+                                if (isSelected) {
+                                  setTmdbTvTypes(prev => prev.filter(v => v !== option.value));
+                                } else {
+                                  setTmdbTvTypes(prev => [...prev, option.value]);
+                                }
+                              }}
+                            >
+                              {option.label}
+                            </Badge>
+                          );
+                        })}
+                      </div>
+                      {tmdbTvTypes.length > 0 && (
+                        <button
+                          type="button"
+                          className="text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => setTmdbTvTypes([])}
+                        >
+                          Clear selection
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {catalogType === 'series' && (
+                    <div className="space-y-2">
                       <LabelWithTooltip tooltip="Filter TV shows by their current airing status. Select multiple to include shows matching any of the chosen statuses.">
                         Status
                       </LabelWithTooltip>
@@ -3556,6 +3742,44 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
                           type="button"
                           className="text-xs text-muted-foreground hover:text-foreground"
                           onClick={() => { setTmdbTvStatuses([]); setReleasedOnly(false); }}
+                        >
+                          Clear selection
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {catalogType === 'movie' && (
+                    <div className="space-y-2">
+                      <LabelWithTooltip tooltip="Filter movies by how they were released. Select multiple to include movies matching any of the chosen types. Pair this with a release region to ask about that country's releases.">
+                        Release Type
+                      </LabelWithTooltip>
+                      <div className="flex flex-wrap gap-2">
+                        {TMDB_MOVIE_RELEASE_TYPE_OPTIONS.map(option => {
+                          const isSelected = tmdbMovieReleaseTypes.includes(option.value);
+                          return (
+                            <Badge
+                              key={option.value}
+                              variant={isSelected ? 'default' : 'outline'}
+                              className="cursor-pointer select-none"
+                              onClick={() => {
+                                setReleasedOnly(false);
+                                if (isSelected) {
+                                  setTmdbMovieReleaseTypes(prev => prev.filter(v => v !== option.value));
+                                } else {
+                                  setTmdbMovieReleaseTypes(prev => [...prev, option.value]);
+                                }
+                              }}
+                            >
+                              {option.label}
+                            </Badge>
+                          );
+                        })}
+                      </div>
+                      {tmdbMovieReleaseTypes.length > 0 && (
+                        <button
+                          type="button"
+                          className="text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => { setTmdbMovieReleaseTypes([]); setReleasedOnly(false); }}
                         >
                           Clear selection
                         </button>
@@ -3923,14 +4147,14 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
               <CardHeader>
                 <CardTitle className="text-base">
                   {discoverSource === 'tmdb'
-                    ? (catalogType === 'movie' ? 'People, Companies, and Keywords' : 'Companies and Keywords')
+                    ? (catalogType === 'movie' ? 'People, Companies, and Keywords' : 'Companies, Networks, and Keywords')
                     : 'Production Company'}
                 </CardTitle>
                 <CardDescription>
                   {discoverSource === 'tmdb'
                     ? (catalogType === 'movie'
                         ? 'Search TMDB and add IDs for cast/crew, studios, and keyword filters.'
-                        : 'Search TMDB and add IDs for studios and keyword filters.')
+                        : 'Search TMDB and add IDs for studios, networks, and keyword filters.')
                     : 'Search TVDB companies and add a production company filter.'}
                 </CardDescription>
               </CardHeader>
@@ -4173,6 +4397,82 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
                     )}
                   </div>
                 </div>
+
+                {discoverSource === 'tmdb' && catalogType === 'series' && (
+                  <div className="space-y-2" ref={networkSearchRef}>
+                    <Label>Networks ({withNetworks.length} selected)</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        placeholder="Search network (e.g. HBO)"
+                        value={networkQuery}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setNetworkQuery(value);
+                          setActiveSearchDropdown(prev => (prev === 'network' ? null : prev));
+                          if (!value.trim()) {
+                            setNetworkResults([]);
+                          }
+                        }}
+                        onFocus={() => {
+                          if (networkResults.length > 0) {
+                            setActiveSearchDropdown('network');
+                          }
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            searchEntity('network', networkQuery, setIsSearchingNetworks, setNetworkResults);
+                          } else if (event.key === 'Escape') {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setActiveSearchDropdown(null);
+                          }
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => searchEntity('network', networkQuery, setIsSearchingNetworks, setNetworkResults)}
+                        disabled={isSearchingNetworks || !networkQuery.trim()}
+                      >
+                        {isSearchingNetworks ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                      </Button>
+                    </div>
+                    {activeSearchDropdown === 'network' && networkResults.length > 0 && (
+                      <div className="max-h-32 overflow-y-auto border rounded-md p-2 space-y-1">
+                        <div className="flex items-center justify-between pb-1 border-b">
+                          <p className="text-xs text-muted-foreground">{networkResults.length} results</p>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-2 text-xs"
+                            onClick={() => setActiveSearchDropdown(null)}
+                          >
+                            Close
+                          </Button>
+                        </div>
+                        {networkResults.map(network => (
+                          <div key={network.id} className="flex items-center justify-between gap-2 text-sm">
+                            <span className="truncate">{network.name || `ID ${network.id}`}</span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => {
+                                setWithNetworks(prev => addUniqueItem(prev, toSelectionItem(network)));
+                                setActiveSearchDropdown(null);
+                              }}
+                            >
+                              Add
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {renderSelectedItems(withNetworks, (id) => setWithNetworks(prev => removeItemById(prev, id)), 'No networks selected')}
+                  </div>
+                )}
 
                 {discoverSource === 'tmdb' && (
                 <div className="space-y-2" ref={keywordSearchRef}>
@@ -5148,13 +5448,50 @@ export function DiscoverBuilderDialog({ isOpen, onClose, editingCatalog, customi
                           }}
                         />
                       </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>Episode Air Date Presets</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Matches shows with an episode airing in the range, rather than shows that premiered in it.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {DATE_PRESET_OPTIONS.map(option => (
+                          <Button
+                            key={option.value}
+                            type="button"
+                            size="sm"
+                            variant={airDatePreset === option.value ? 'default' : 'outline'}
+                            onClick={() => applyDatePreset('airDate', option.value)}
+                          >
+                            {option.label}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-2">
                         <Label htmlFor="air-date-from">Episode Air Date From</Label>
-                        <Input id="air-date-from" type="date" value={airDateFrom} onChange={(event) => setAirDateFrom(event.target.value)} />
+                        <Input
+                          id="air-date-from"
+                          type="date"
+                          value={airDateFrom}
+                          onChange={(event) => {
+                            setAirDateFrom(event.target.value);
+                            setAirDatePreset('custom');
+                          }}
+                        />
                       </div>
                       <div className="space-y-2">
                         <Label htmlFor="air-date-to">Episode Air Date To</Label>
-                        <Input id="air-date-to" type="date" value={airDateTo} onChange={(event) => setAirDateTo(event.target.value)} />
+                        <Input
+                          id="air-date-to"
+                          type="date"
+                          value={airDateTo}
+                          onChange={(event) => {
+                            setAirDateTo(event.target.value);
+                            setAirDatePreset('custom');
+                          }}
+                        />
                       </div>
                     </div>
                   </div>

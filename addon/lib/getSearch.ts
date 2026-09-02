@@ -1,3 +1,4 @@
+const { tvdbLanguageChain, pickTranslation, pickArtwork }: any = require('../utils/tvdbLanguage');
 require("dotenv").config();
 const { getGenreList }: any = require("./getGenreList");
 const Utils: any = require("../utils/parseProps");
@@ -12,10 +13,15 @@ const idMapper: any = require('./id-mapper');
 const kitsu: any = require('./kitsu');
 const { resolveAllIds }: any = require('./id-resolver');
 const { isAnime }: any = require("../utils/isAnime");
-const { performGeminiSearch }: any = require('../utils/gemini-service');
+const { performGeminiSearch, resolveGeminiModel }: any = require('../utils/gemini-service');
 const { performOpenRouterSearch }: any = require('../utils/openrouter-service');
 import consola from 'consola';
-const { cacheWrapMetaSmart }: any = require('./getCache');
+import { tmdbImageUrl, tmdbLogoSize, tmdbBackdropSize, tmdbPosterSize } from '../utils/tmdbImageSize';
+import { hasAgeRatingCap } from '../utils/ageRating';
+const { cacheWrapMetaSmart, cacheWrapGlobal }: any = require('./getCache');
+const { getSetting }: any = require('./settingsService');
+import { fetchImdbSuggestions, type ImdbSuggestion } from '../utils/imdbSuggestions.js';
+import { mapWithLimit } from '../utils/concurrency.js';
 const wikiMappings: any = require('./wiki-mapper');
 
 
@@ -51,6 +57,12 @@ function getTvdbCertification(contentRatings: any[], countryCode: string, conten
 }
 
 
+const SIMKL_SEARCH_PROVIDERS = new Set(['simkl.search', 'simkl.search.movie', 'simkl.search.series']);
+
+function isSimklSearchDisabled(): boolean {
+  return getSetting('DISABLE_SIMKL_SEARCH') === 'true';
+}
+
 function getDefaultProvider(type: string): string {
   if (type === 'movie') return 'tmdb.search';
   if (type === 'series') return 'tvdb.search';
@@ -85,8 +97,7 @@ const findArtwork = (artworks: any[], type: number, lang: string | null, config:
     return artworks?.find((a: any) => a.type === type && a.language === 'eng')?.image
       || artworks?.find((a: any) => a.type === type)?.image;
   }
-  return artworks?.find((a: any) => a.type === type && a.language === lang)?.image
-    || artworks?.find((a: any) => a.type === type && a.language === 'eng')?.image
+  return pickArtwork(artworks, type, tvdbLanguageChain(lang), 'image')
     || artworks?.find((a: any) => a.type === type)?.image;
 };
 
@@ -96,13 +107,9 @@ async function parseTvdbSearchResult(type: string, extendedRecord: any, language
   const langCode3 = await to3LetterCode(language, config);
   const overviewTranslations = extendedRecord.translations?.overviewTranslations || [];
   const nameTranslations = extendedRecord.translations?.nameTranslations || [];
-  const translatedName = nameTranslations.find((t: any) => t.language === langCode3)?.name
-                       || nameTranslations.find((t: any) => t.language === 'eng')?.name
-                       || extendedRecord.name;
-
-  const overview = overviewTranslations.find((t: any) => t.language === langCode3)?.overview
-                   || overviewTranslations.find((t: any) => t.language === 'eng')?.overview
-                   || extendedRecord.overview;
+  const langChain = tvdbLanguageChain(langCode3);
+  const translatedName = pickTranslation(nameTranslations, langChain, 'name') || extendedRecord.name;
+  const overview = pickTranslation(overviewTranslations, langChain, 'overview') || extendedRecord.overview;
 
   let tmdbId = extendedRecord.remoteIds?.find((id: any) => id.sourceName === 'TheMovieDB.com')?.id;
   let imdbId = extendedRecord.remoteIds?.find((id: any) => id.sourceName === 'IMDB')?.id;
@@ -134,7 +141,8 @@ async function parseTvdbSearchResult(type: string, extendedRecord: any, language
 
   let certification: string | null = null;
   let certificationLocal: string | null = null;
-  if (config.displayAgeRating) {
+  let movieReleaseDates: any = null;
+  if (config.displayAgeRating || hasAgeRatingCap(config)) {
     try {
       const langParts = language.split('-');
       const userCountry = langParts[1] || langParts[0];
@@ -144,6 +152,7 @@ async function parseTvdbSearchResult(type: string, extendedRecord: any, language
         if (type === 'movie') {
           const releaseDatesData = await moviedb.movieReleaseDates(String(tmdbId), config);
           if (releaseDatesData) {
+            movieReleaseDates = releaseDatesData;
             certification = Utils.getTmdbMovieCertificationForCountry(releaseDatesData);
             certificationLocal = userCountry && userCountry.toUpperCase() !== 'US'
               ? (Utils.getTmdbMovieCertificationForCountry(releaseDatesData, userCountry) || certification)
@@ -171,6 +180,24 @@ async function parseTvdbSearchResult(type: string, extendedRecord: any, language
     }
   }
 
+  const firstReleaseDate = extendedRecord.first_release?.Date || extendedRecord.first_release?.date;
+  const released = extendedRecord.firstAired
+    ? new Date(extendedRecord.firstAired)
+    : (firstReleaseDate ? new Date(firstReleaseDate) : undefined);
+
+  // isReleasedDigitally only consults TMDB release data for movies newer than a year
+  if (type === 'movie' && tmdbId && config.hideUnreleasedDigitalSearch && !movieReleaseDates) {
+    const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+    const releasedOverAYearAgo = released && !isNaN(released.getTime()) && Date.now() - released.getTime() >= ONE_YEAR_MS;
+    if (!releasedOverAYearAgo) {
+      try {
+        movieReleaseDates = await moviedb.movieReleaseDates(String(tmdbId), config);
+      } catch (error: any) {
+        logger.debug(`Failed to get TMDB release dates for movie ${tmdbId}: ${error.message}`);
+      }
+    }
+  }
+
   let stremioId: string = `tvdb:${extendedRecord.id}`;
   if(imdbId) stremioId = imdbId;
   const logoUrl = findArtwork(extendedRecord.artworks, type === 'movie' ? 25 : 23, langCode3, config);
@@ -183,10 +210,19 @@ async function parseTvdbSearchResult(type: string, extendedRecord: any, language
     poster: Utils.isPosterRatingEnabled(config) ? posterProxyUrl : validPosterUrl,
     _rawPosterUrl: rawPosterUrl,
     year: extendedRecord.year,
-    released: extendedRecord.firstAired ? new Date(extendedRecord.firstAired) : undefined,
+    releaseInfo: type === 'movie'
+      ? (extendedRecord.year || '')
+      : Utils.buildReleaseInfo(
+          extendedRecord.firstAired,
+          extendedRecord.lastAired,
+          extendedRecord.status?.name === 'Continuing'
+        ) || extendedRecord.year || '',
+    released: released,
     description: Utils.addMetaProviderAttribution(overview, 'TVDB', config),
     certification: certification,
-    app_extras: { certification, certificationLocal },
+    app_extras: movieReleaseDates
+      ? { certification, certificationLocal, releaseDates: movieReleaseDates }
+      : { certification, certificationLocal },
     logo: validLogoUrl,
     runtime: type === 'movie' ? Utils.parseRunTime(extendedRecord.runtime) : Utils.parseRunTime(extendedRecord.averageRuntime),
     genres: extendedRecord.genres?.map((g: any) => g.name) || [],
@@ -204,11 +240,11 @@ async function performAnimeSearch(type: string, query: string, language: string,
   switch(type){
     case 'movie':
       logger.debug('Performing anime search for movie:', query);
-      searchResults = await jikan.searchAnime('movie', query, 25, config, page);
+      searchResults = await jikan.searchAnime('movie', query, jikan.malPageSize(), config, page);
       break;
     case 'series': {
       const desiredTvTypes = config.mal?.useImdbIdForCatalogAndSearch ?  new Set(['tv', 'ona']) : new Set(['tv', 'ova', 'ona', 'tv special']);
-      searchResults = await jikan.searchAnime('anime', query, 25, config, page);
+      searchResults = await jikan.searchAnime('anime', query, jikan.malPageSize(), config, page);
       searchResults = searchResults.filter((item: any) => {
         return typeof item?.type === 'string' && desiredTvTypes.has(item.type.toLowerCase());
       });
@@ -216,7 +252,7 @@ async function performAnimeSearch(type: string, query: string, language: string,
     }
     default: {
       const desiredTypes = new Set(['tv', 'movie', 'ova', 'ona', 'tv special']);
-      searchResults = await jikan.searchAnime('anime', query, 25, config, page);
+      searchResults = await jikan.searchAnime('anime', query, jikan.malPageSize(), config, page);
       searchResults = searchResults.filter((item: any) => {
         return typeof item?.type === 'string' && desiredTypes.has(item.type.toLowerCase());
       });
@@ -278,7 +314,9 @@ async function performKitsuSearch(type: string, query: string, language: string,
 
           let itemType = type;
           if (item.subtype?.toLowerCase() === 'ona') {
-            if (malId) {
+            if (item.episodeCount > 1) {
+              itemType = 'series';
+            } else if (malId) {
               itemType = await idMapper.resolveOnaType(malId, config);
             } else if (item.episodeCount === 1) {
               itemType = 'movie';
@@ -416,6 +454,11 @@ async function performTmdbSearch(type: string, query: string, language: string, 
       logger.error(`Error searching TMDB by IMDb ID ${query}:`, error.message);
       return [];
     }
+  } else if (/^tmdb:\d+$/.test(query.trim()) && !peopleOnly) {
+    // Lets a provider that already resolved a TMDB id reuse the hydration below
+    // instead of searching for a title it has no reason to guess at.
+    const tmdbId = Number(query.trim().split(':')[1]);
+    rawResults.set(tmdbId, { id: tmdbId, media_type: type === 'movie' ? 'movie' : 'tv' });
   } else {
     const addRawResult = (media: any) => {
       if (media && media.id && !rawResults.has(media.id)) {
@@ -440,8 +483,8 @@ async function performTmdbSearch(type: string, query: string, language: string, 
       peopleOnly
           ? Promise.resolve({ results: [] })
           : (type === 'movie'
-              ? moviedb.searchMovie({ query, language, include_adult: config.includeAdult, page }, config)
-              : moviedb.searchTv({ query, language, include_adult: config.includeAdult, page }, config)),
+              ? moviedb.searchMovie({ query, language, include_adult: !excludesAdult(config), page }, config)
+              : moviedb.searchTv({ query, language, include_adult: !excludesAdult(config), page }, config)),
 
       shouldSearchPersons
           ? moviedb.searchPerson({ query, language: language }, config).then(async (personRes: any) => {
@@ -586,9 +629,9 @@ async function performTmdbSearch(type: string, query: string, language: string, 
         const selectedLogo = Utils.selectTmdbImageByLang(details.images?.logos, config, 'iso_639_1', originalLanguage);
         const selectedPoster = Utils.selectTmdbImageByLang(details.images?.posters, config, 'iso_639_1', originalLanguage);
         const fallbackImage = `${host}/missing_poster.png`;
-        logoUrl = selectedLogo?.file_path ? `https://image.tmdb.org/t/p/original${selectedLogo?.file_path}` : null;
-        backgroundUrl = selectedBg?.file_path ? `https://image.tmdb.org/t/p/original${selectedBg?.file_path}` : details.backdrop_path ? `https://image.tmdb.org/t/p/original${details.backdrop_path}` : null;
-        posterUrl = selectedPoster?.file_path ? `https://image.tmdb.org/t/p/original${selectedPoster?.file_path}` : details.poster_path ? `https://image.tmdb.org/t/p/original${details.poster_path}` : fallbackImage;
+        logoUrl = selectedLogo?.file_path ? tmdbImageUrl(tmdbLogoSize(selectedLogo?.width), selectedLogo?.file_path) : null;
+        backgroundUrl = selectedBg?.file_path ? tmdbImageUrl(tmdbBackdropSize(selectedBg?.width), selectedBg?.file_path) : details.backdrop_path ? tmdbImageUrl(tmdbBackdropSize(), details.backdrop_path) : null;
+        posterUrl = selectedPoster?.file_path ? tmdbImageUrl(tmdbPosterSize(), selectedPoster?.file_path) : details.poster_path ? tmdbImageUrl(tmdbPosterSize(), details.poster_path) : fallbackImage;
 
         const imdbRating = allIds.imdbId ? await getImdbRating(allIds.imdbId, mediaType) : null;
 
@@ -639,27 +682,15 @@ async function performTmdbSearch(type: string, query: string, language: string, 
   logger.info(`Hydration complete in ${Date.now() - startTime}ms. Found ${hydratedResults.length} valid items.`);
 
   let keywordFilteredResults;
-  if (config.includeAdult === false) {
-    const adultKeywordBlacklist = ['porn', 'porno', 'soft porn', 'softcore', 'pinku-eiga','erotica', 'erotic film', 'erotic movie', 'adult video'];
-    logger.debug(`Filtering results with adult keyword blacklist as includeAdult is false.`);
+  if (excludesAdult(config)) {
+    // The id branches above reach TMDB through find(), which takes no include_adult,
+    // so a title arriving by imdb id is only caught here.
     keywordFilteredResults = hydratedResults.filter((result: any) => {
-        const keywordsObject = result.details.keywords;
-        if (!keywordsObject) {
-            return true;
-        }
-
-        const keywords = keywordsObject.results || keywordsObject.keywords || [];
-
-        for (const keyword of keywords) {
-            const keywordName = keyword.name.toLowerCase();
-            if (adultKeywordBlacklist.includes(keywordName)) {
-                logger.info(`Item "${result.parsed.name}" was filtered because of keyword "${keyword.name}"`);
-                return false;
-            }
-        }
-        return true;
+        if (!isAdultTmdbItem(result.details)) return true;
+        logger.info(`Item "${result.parsed.name}" was filtered as adult`);
+        return false;
     });
-    logger.debug(`Keyword filtering applied: ${hydratedResults.length} -> ${keywordFilteredResults.length} results.`);
+    logger.debug(`Adult filtering applied: ${hydratedResults.length} -> ${keywordFilteredResults.length} results.`);
   } else {
     keywordFilteredResults = hydratedResults;
   }
@@ -667,37 +698,6 @@ async function performTmdbSearch(type: string, query: string, language: string, 
   const hydratedMetas = keywordFilteredResults.map((result: any) => result.parsed);
 
   let filteredResults = hydratedMetas;
-  if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-      const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-      const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-      const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-      filteredResults = filteredResults.filter((result: any) => {
-          const cert = result.certification;
-
-          const isTvRating = type === 'series';
-          const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-          const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                         (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                          movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                         (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                          tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-          if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-              return !isUserRatingRestrictive;
-          }
-
-          const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-          const userRatingIndex = ratingHierarchy.indexOf(userRating);
-          const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-          if (userRatingIndex === -1) return true;
-          if (resultRatingIndex === -1) return true;
-
-          return resultRatingIndex <= userRatingIndex;
-      });
-      logger.debug(`Age rating filter applied: ${hydratedMetas.length} -> ${filteredResults.length} results.`);
-  }
   if (type === 'movie' && config.hideUnreleasedDigitalSearch) {
     const beforeCount = filteredResults.length;
     filteredResults = filteredResults.filter((meta: any) => Utils.isReleasedDigitally(meta));
@@ -709,6 +709,308 @@ async function performTmdbSearch(type: string, query: string, language: string, 
 
   logger.success(`Completed TMDB search for "${query}" in ${Date.now() - startTime}ms. Returning ${filteredResults.length} results.`);
   return filteredResults;
+}
+
+/**
+ * IMDb's own autocomplete. It tolerates typos that TMDB and TVDB reject outright,
+ * so it is used only to turn a loose query into IMDb ids; every id is then handed
+ * to the TMDB search path, which already resolves an IMDb id into a full meta.
+ */
+async function performImdbSuggestionSearch(type: string, query: string, language: string, config: any): Promise<any[]> {
+  const startTime = Date.now();
+  logger.info(`Starting IMDb suggestion search for type "${type}" with query: "${query}"`);
+
+  const timeoutMs = parseInt(getSetting('IMDB_SUGGESTION_TIMEOUT_MS'), 10) || 5000;
+  const ttl = parseInt(getSetting('IMDB_SUGGESTION_TTL_SECONDS'), 10);
+  const limit = parseInt(getSetting('IMDB_SUGGESTION_RESULT_LIMIT'), 10) || 12;
+
+  const cacheKey = `imdb-suggest:${type}:${query.toLowerCase().trim()}`;
+  let suggestions: ImdbSuggestion[];
+  try {
+    suggestions = ttl > 0
+      ? await cacheWrapGlobal(cacheKey, () => fetchImdbSuggestions(type, query, timeoutMs), ttl)
+      : await fetchImdbSuggestions(type, query, timeoutMs);
+  } catch (error: any) {
+    if (error?.name === 'ImdbSuggestionUnavailableError') {
+      logger.error(
+        `IMDb suggestions are not answering, which usually means the endpoint started challenging us. `
+        + `Pick another search provider in Search settings if this persists. ${error.message}`
+      );
+    } else {
+      logger.error(`IMDb suggestion lookup failed for "${query}": ${error.message}`);
+    }
+    return [];
+  }
+
+  if (!suggestions || suggestions.length === 0) {
+    logger.info(`No IMDb suggestions found for query: "${query}"`);
+    return [];
+  }
+
+  const limited = suggestions.slice(0, limit);
+  logger.debug(`IMDb returned ${suggestions.length} suggestions, hydrating ${limited.length}`);
+
+  const hydrated = await mapWithLimit(limited, (suggestion: ImdbSuggestion) =>
+    performTmdbSearch(type, suggestion.imdbId, language, config, false)
+      .catch((error: any) => {
+        logger.debug(`Could not hydrate ${suggestion.imdbId} (${suggestion.title}): ${error.message}`);
+        return [];
+      }));
+
+  // IMDb's rank ordering is the reason to use it, so results keep suggestion order.
+  const seen = new Set<string>();
+  const metas: any[] = [];
+  for (const group of hydrated) {
+    for (const meta of group) {
+      if (meta?.id && !seen.has(meta.id)) {
+        seen.add(meta.id);
+        metas.push(meta);
+      }
+    }
+  }
+
+  logger.info(`IMDb suggestion search completed in ${Date.now() - startTime}ms, returning ${metas.length} results`);
+  return metas;
+}
+
+/**
+ * Simkl's anime endpoint answers with every format at once, so the requested type has
+ * to be applied here. The sets mirror performAnimeSearch, with Simkl's 'special'
+ * standing in for MAL's 'tv special'.
+ */
+function simklAnimeTypesFor(type: string, config: any): Set<string> {
+  if (type === 'movie') return new Set(['movie']);
+  return config.mal?.useImdbIdForCatalogAndSearch
+    ? new Set(['tv', 'ona'])
+    : new Set(['tv', 'ova', 'ona', 'special']);
+}
+
+/**
+ * Simkl search items name their fields differently from the catalog items
+ * parseSimklItems expects, so line them up before handing them over.
+ */
+function normalizeSimklSearchItem(item: any, type: string): any {
+  const year = typeof item?.year === 'number' ? item.year : null;
+  return {
+    ...item,
+    type: type === 'movie' ? 'movie' : 'series',
+    title: item?.title || item?.title_romaji || item?.title_en || '',
+    release_date: item?.release_date || (year ? `01/01/${year}` : undefined),
+  };
+}
+
+/**
+ * Fribb's mapping turns a simkl id into a MAL id in memory, which routes results
+ * through the same anime meta path MAL and Kitsu search use rather than emitting a
+ * TMDB id that would bypass anime_id_provider and useImdbIdForCatalogAndSearch.
+ */
+async function performSimklAnimeSearch(type: string, query: string, language: string, config: any, page: number = 1): Promise<any[]> {
+  const startTime = Date.now();
+  logger.info(`Starting Simkl anime search for type "${type}" with query: "${query}"`);
+
+  const { fetchSimklSearchItems, parseSimklItems }: any = require('../utils/simklUtils.js');
+  const limit = parseInt(getSetting('SIMKL_ANIME_SEARCH_RESULT_LIMIT'), 10) || 20;
+
+  const results = await fetchSimklSearchItems('anime', query, limit, page);
+  if (!results || results.length === 0) {
+    logger.info(`No Simkl anime results found for query: "${query}"`);
+    return [];
+  }
+
+  const itemType = type === 'movie' ? 'movie' : 'series';
+  const allowedTypes = simklAnimeTypesFor(itemType, config);
+  const matching = results.filter((item: any) => {
+    // Simkl documents anime_type but search answers with type.
+    const format = item?.anime_type || item?.type;
+    return typeof format === 'string' && allowedTypes.has(format.toLowerCase());
+  });
+
+  if (matching.length === 0) {
+    logger.info(`Simkl returned ${results.length} results for "${query}" but none were ${itemType}`);
+    return [];
+  }
+
+  const items = matching.map((item: any) => normalizeSimklSearchItem(item, itemType));
+  const metas = await parseSimklItems(items, itemType, config, config.userUUID, false, true);
+
+  logger.info(`Simkl anime search returned ${metas.length} of ${results.length} results in ${Date.now() - startTime}ms`);
+  return metas;
+}
+
+const ADULT_GENRES = new Set(['hentai', 'erotica', 'erotic', 'adult', 'pornographic', 'porn']);
+
+/** TMDB keyword names that mark a title adult when its `adult` flag does not. */
+const ADULT_KEYWORDS = new Set([
+  'porn', 'porno', 'soft porn', 'softcore', 'pinku-eiga',
+  'erotica', 'erotic film', 'erotic movie', 'adult video', 'hentai',
+]);
+
+/** A config that predates the field still filters, since the default is off. */
+function excludesAdult(config: any): boolean {
+  return config?.includeAdult !== true;
+}
+
+function isAdultTmdbItem(details: any): boolean {
+  if (details?.adult === true) return true;
+  const keywords = details?.keywords?.results || details?.keywords?.keywords || [];
+  return keywords.some((keyword: any) => ADULT_KEYWORDS.has(String(keyword?.name || '').toLowerCase()));
+}
+
+/** `_m` is the largest true 2:3 poster Simkl stores; `_w` is a landscape crop. */
+function simklPosterUrl(poster: string | null | undefined): string | null {
+  return poster ? `https://wsrv.nl/?url=https://simkl.in/posters/${poster}_m.webp&q=90` : null;
+}
+
+/**
+ * Search never carries an imdb id and drops the tmdb one on a fair share of series.
+ * The anime mapper knows a lot of simkl ids already, so it is tried first and the
+ * detail call is what is left over.
+ */
+function simklIdsFromMapper(simklId: string | number | null | undefined): Record<string, any> | null {
+  if (!simklId) return null;
+  const mapping = idMapper.getMappingBySimklId(simklId);
+  if (!mapping) return null;
+  return {
+    tmdb: mapping.themoviedb_id || null,
+    tvdb: mapping.tvdb_id || null,
+    imdb: mapping.imdb_id || null,
+  };
+}
+
+/**
+ * Simkl searches every translated title it stores, so it answers alias queries that
+ * title-only engines miss. Its search payload carries title, year, poster, ratings and
+ * status, so metas are built from it directly rather than re-fetched from TMDB.
+ */
+async function performSimklSearch(type: string, query: string, language: string, config: any, page: number = 1): Promise<any[]> {
+  const startTime = Date.now();
+  logger.info(`Starting Simkl search for type "${type}" with query: "${query}"`);
+
+  const { fetchSimklSearchItems, fetchSimklItemDetail }: any = require('../utils/simklUtils.js');
+  const limit = parseInt(getSetting('SIMKL_SEARCH_RESULT_LIMIT'), 10) || 20;
+  const searchType = type === 'movie' ? 'movie' : 'tv';
+
+  const results = await fetchSimklSearchItems(searchType, query, limit, page);
+  if (!results || results.length === 0) {
+    logger.info(`No Simkl results found for query: "${query}"`);
+    return [];
+  }
+
+  let detailLookups = 0;
+
+  const built = await mapWithLimit(results, async (item: any) => {
+    try {
+      const simklId = item?.ids?.simkl_id || item?.ids?.simkl;
+      const mapped = item?.ids?.tmdb ? null : simklIdsFromMapper(simklId);
+      let detail: any = null;
+      if (!item?.ids?.tmdb && !mapped?.imdb && !mapped?.tmdb && !mapped?.tvdb) {
+        detail = await fetchSimklItemDetail(searchType, simklId);
+        detailLookups++;
+      }
+
+      const ids = { ...(item?.ids || {}), ...(mapped || {}), ...(detail?.ids || {}) };
+      const tmdbId = ids.tmdb ? String(ids.tmdb) : null;
+      const tvdbId = ids.tvdb ? String(ids.tvdb) : null;
+      let imdbId = ids.imdb || null;
+
+      if (!imdbId && (tmdbId || tvdbId)) {
+        const resolved = await resolveAllIds(
+          tmdbId ? `tmdb:${tmdbId}` : `tvdb:${tvdbId}`,
+          type,
+          config,
+          { tmdbId, tvdbId },
+          ['imdb']
+        );
+        imdbId = resolved?.imdbId || null;
+      }
+
+      const stremioId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : (tvdbId ? `tvdb:${tvdbId}` : null));
+      if (!stremioId) {
+        logger.debug(`Skipping Simkl result "${item?.title}" - no id we can address it by`);
+        return null;
+      }
+
+      const fallbackImage = `${host}/missing_poster.png`;
+      const rawPosterUrl = simklPosterUrl(item?.poster || detail?.poster);
+      const posterUrl = rawPosterUrl && !rawPosterUrl.includes('undefined') ? rawPosterUrl : fallbackImage;
+
+      const typedProxyId = type === 'movie'
+        ? (tmdbId ? `tmdb:${tmdbId}` : null)
+        : (tvdbId ? `tvdb:${tvdbId}` : (tmdbId ? `tmdb:${tmdbId}` : null));
+      let posterProxyId: string | null = imdbId || typedProxyId;
+      // Top Poster cannot use a tvdb id, so an item with neither imdb nor tmdb has
+      // nothing to send it.
+      if (config.posterRatingProvider === 'top' && !imdbId && !tmdbId) {
+        posterProxyId = null;
+      }
+      const posterProxyUrl = posterProxyId
+        ? Utils.buildPosterProxyUrl(host, type, posterProxyId, posterUrl, language, config)
+        : posterUrl;
+
+      const imdbRating = item?.ratings?.imdb?.rating
+        ?? (imdbId ? await getImdbRating(imdbId, type) : 'N/A');
+
+      let releaseDates: any = null;
+      if (type === 'movie' && tmdbId && config.hideUnreleasedDigitalSearch) {
+        releaseDates = await moviedb.movieReleaseDates(tmdbId, config)
+          .catch((error: any) => {
+            logger.debug(`Failed to get TMDB release dates for movie ${tmdbId}: ${error.message}`);
+            return null;
+          });
+      }
+
+      return {
+        id: stremioId,
+        type,
+        name: item?.title || detail?.title,
+        poster: Utils.isPosterRatingEnabled(config) ? posterProxyUrl : posterUrl,
+        description: Utils.addMetaProviderAttribution(item?.overview || detail?.overview || '', 'Simkl', config),
+        certification: item?.certification || detail?.certification || null,
+        logo: imdbId ? imdb.getLogoFromImdb(imdbId) : null,
+        genres: item?.genres || detail?.genres || [],
+        year: item?.year || detail?.year || null,
+        released: detail?.released ? new Date(detail.released) : undefined,
+        imdbRating: imdbRating ?? 'N/A',
+        _tmdbId: tmdbId || undefined,
+        _tvdbId: tvdbId || undefined,
+        runtime: type === 'movie' ? Utils.parseRunTime(item?.runtime ?? detail?.runtime) : null,
+        status: type === 'series' ? (item?.status || detail?.status || null) : null,
+        ...(releaseDates ? { app_extras: { releaseDates } } : {}),
+      };
+    } catch (error: any) {
+      logger.error(`Error parsing Simkl result "${item?.title}":`, error.message);
+      return null;
+    }
+  });
+
+  // Simkl orders by its own relevance, which is the reason to use it.
+  const seenMetas = new Set<string>();
+  let metas: any[] = [];
+  for (const meta of built) {
+    if (meta?.id && !seenMetas.has(meta.id)) {
+      seenMetas.add(meta.id);
+      metas.push(meta);
+    }
+  }
+
+  if (excludesAdult(config)) {
+    const beforeCount = metas.length;
+    metas = metas.filter((meta: any) => !meta.genres?.some((genre: string) => ADULT_GENRES.has(String(genre).toLowerCase())));
+    if (beforeCount !== metas.length) {
+      logger.info(`Adult filter (Simkl): filtered out ${beforeCount - metas.length} results`);
+    }
+  }
+
+  if (type === 'movie' && config.hideUnreleasedDigitalSearch) {
+    const beforeCount = metas.length;
+    metas = metas.filter((meta: any) => Utils.isReleasedDigitally(meta));
+    if (beforeCount !== metas.length) {
+      logger.info(`Digital release filter (Simkl): filtered out ${beforeCount - metas.length} unreleased movies`);
+    }
+  }
+
+  logger.info(`Simkl search completed in ${Date.now() - startTime}ms, returning ${metas.length} of ${results.length} results (${detailLookups} detail lookups)`);
+  return metas;
 }
 
 async function performTmdbPeopleSearch(type: string, query: string, language: string, config: any, page: number = 1): Promise<any[]> {
@@ -827,7 +1129,7 @@ async function performTmdbPeopleSearch(type: string, query: string, language: st
       }
     }
 
-    if (config.includeAdult === false) {
+    if (excludesAdult(config)) {
       const beforeAdult = pageResults.length;
       pageResults = pageResults.filter((media: any) => !media.adult);
       if (beforeAdult !== pageResults.length) {
@@ -846,10 +1148,10 @@ async function performTmdbPeopleSearch(type: string, query: string, language: st
         if (!title) return null;
 
         const posterPath = media.poster_path
-          ? `https://image.tmdb.org/t/p/original${media.poster_path}`
+          ? tmdbImageUrl(tmdbPosterSize(), media.poster_path)
           : fallbackImage;
         const backgroundPath = media.backdrop_path
-          ? `https://image.tmdb.org/t/p/original${media.backdrop_path}`
+          ? tmdbImageUrl(tmdbBackdropSize(), media.backdrop_path)
           : null;
 
         let stremioId = `tmdb:${media.id}`;
@@ -901,7 +1203,7 @@ async function matchAndEnrichFromTMDB(suggestion: { title: string; year: string 
     const searchParams = {
       query: title,
       language: 'en-US',
-      include_adult: config.includeAdult || false,
+      include_adult: !excludesAdult(config),
       page: 1
     };
 
@@ -968,20 +1270,9 @@ async function matchAndEnrichFromTMDB(suggestion: { title: string; year: string 
           include_image_language: imageLanguages
         }, config);
 
-    if (config.includeAdult === false) {
-      const adultKeywordBlacklist = ['porn', 'porno', 'soft porn', 'softcore', 'pinku-eiga'];
-      const keywordsObject = details.keywords;
-
-      if (keywordsObject) {
-        const keywords = keywordsObject.results || keywordsObject.keywords || [];
-
-        for (const keyword of keywords) {
-          if (adultKeywordBlacklist.includes(keyword.name.toLowerCase())) {
-            logger.debug(`Item "${title}" filtered because of blacklist keyword "${keyword.name}"`);
-            return null;
-          }
-        }
-      }
+    if (excludesAdult(config) && isAdultTmdbItem(details)) {
+      logger.debug(`Item "${title}" filtered as adult`);
+      return null;
     }
 
     let allIds: any = {
@@ -999,11 +1290,11 @@ async function matchAndEnrichFromTMDB(suggestion: { title: string; year: string 
     const selectedPoster = Utils.selectTmdbImageByLang(details.images?.posters, config, 'iso_639_1', originalLanguage);
 
     const fallbackImage = `${host}/missing_poster.png`;
-    const logoUrl = selectedLogo?.file_path ? `https://image.tmdb.org/t/p/original${selectedLogo.file_path}` : null;
-    const backgroundUrl = selectedBg?.file_path ? `https://image.tmdb.org/t/p/original${selectedBg.file_path}`
-      : details.backdrop_path ? `https://image.tmdb.org/t/p/original${details.backdrop_path}` : null;
-    const posterUrl = selectedPoster?.file_path ? `https://image.tmdb.org/t/p/original${selectedPoster.file_path}`
-      : details.poster_path ? `https://image.tmdb.org/t/p/original${details.poster_path}` : fallbackImage;
+    const logoUrl = selectedLogo?.file_path ? tmdbImageUrl(tmdbLogoSize(selectedLogo.width), selectedLogo.file_path) : null;
+    const backgroundUrl = selectedBg?.file_path ? tmdbImageUrl(tmdbBackdropSize(selectedBg.width), selectedBg.file_path)
+      : details.backdrop_path ? tmdbImageUrl(tmdbBackdropSize(), details.backdrop_path) : null;
+    const posterUrl = selectedPoster?.file_path ? tmdbImageUrl(tmdbPosterSize(), selectedPoster.file_path)
+      : details.poster_path ? tmdbImageUrl(tmdbPosterSize(), details.poster_path) : fallbackImage;
 
     const validPosterUrl = posterUrl && posterUrl !== 'null' && !posterUrl.includes('undefined')
       ? posterUrl : fallbackImage;
@@ -1058,21 +1349,26 @@ async function matchAndEnrichFromTMDB(suggestion: { title: string; year: string 
 async function performAiSearch(query: string, language: string, config: any): Promise<any[]> {
   const startTime = Date.now();
   const aiProvider = config.search?.ai_provider || 'gemini';
-  const aiModel = config.search?.ai_model || (aiProvider === 'openrouter' ? 'google/gemini-2.5-flash' : 'gemini-2.5-flash-lite');
-  const aiWebSearch = config.search?.ai_web_search === true;
+  const aiModel = aiProvider === 'openrouter'
+    ? (config.search?.ai_model || 'google/gemini-2.5-flash')
+    : resolveGeminiModel(config.search?.ai_model);
+  const aiWebSearch = aiProvider === 'openrouter'
+    ? config.search?.ai_openrouter_web_search !== false
+    : config.search?.ai_web_search === true;
 
-  logger.info(`Starting AI search for query: "${query}" (provider: ${aiProvider}, model: ${aiModel}, webSearch: ${aiProvider === 'openrouter' ? 'always' : aiWebSearch})`);
+  logger.info(`Starting AI search for query: "${query}" (provider: ${aiProvider}, model: ${aiModel}, webSearch: ${aiWebSearch})`);
 
   try {
     let suggestions: any[];
 
     if (aiProvider === 'openrouter') {
       const openrouterKey = config.apiKeys?.openrouter;
-      const effectiveModel = aiModel && !aiModel.endsWith(':online')
-        ? `${aiModel}:online` : aiModel;
+      const effectiveModel = aiWebSearch
+        ? (aiModel.endsWith(':online') ? aiModel : `${aiModel}:online`)
+        : aiModel.replace(/:online$/, '');
       suggestions = await performOpenRouterSearch(openrouterKey, query, 'mixed', language, effectiveModel);
     } else {
-      const geminiKey = config.apiKeys?.gemini;
+      const geminiKey = config.apiKeys?.gemini || process.env.BUILT_IN_GEMINI_API_KEY;
       suggestions = await performGeminiSearch(geminiKey, query, 'mixed', language, aiModel, aiWebSearch);
     }
 
@@ -1097,42 +1393,6 @@ async function performAiSearch(query: string, language: string, config: any): Pr
     logger.info(`TMDB match+enrich completed in ${enrichTime}ms. Got ${validResults.length} of ${suggestions.length} suggestions`);
 
     let filteredResults = validResults;
-
-    if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-      const beforeCount = filteredResults.length;
-      const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-      const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-      const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-      filteredResults = filteredResults.filter((result: any) => {
-        const cert = result.certification;
-        const isTvRating = result.type === 'series';
-        const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-        const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                       (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                       (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-        if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-          return !isUserRatingRestrictive;
-        }
-
-        const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-        const userRatingIndex = ratingHierarchy.indexOf(userRating);
-        const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-        if (userRatingIndex === -1) return true;
-        if (resultRatingIndex === -1) return true;
-
-        return resultRatingIndex <= userRatingIndex;
-      });
-
-      const afterCount = filteredResults.length;
-      if (beforeCount !== afterCount) {
-        logger.info(`Age rating filter: ${beforeCount} -> ${afterCount} results`);
-      }
-    }
 
     if (config.hideUnreleasedDigitalSearch) {
       const beforeCount = filteredResults.length;
@@ -1231,9 +1491,7 @@ async function performTvdbSearch(type: string, query: string, language: string, 
         return [];
       }
 
-      const tvdbId = type === 'movie'
-        ? results[0]?.movie?.id
-        : results[0]?.series?.id;
+      const tvdbId = tvdb.tvdbIdFromRemoteIdResults(results, type);
 
       if (!tvdbId) {
         logger.info(`No ${type} found in TVDB for IMDb ID ${imdbId}`);
@@ -1308,39 +1566,7 @@ async function performTvdbSearch(type: string, query: string, language: string, 
 
   const sortedResults = Utils.sortTvdbSearchResults(finalResults, sanitizedQuery);
 
-  let ageFilteredResults = sortedResults;
-  if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-    const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-    const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-    const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-    ageFilteredResults = sortedResults.filter((result: any) => {
-      const cert = result.certification;
-
-      const isTvRating = type === 'series';
-      const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-      const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                     (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                      movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                     (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                      tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-      if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-        return !isUserRatingRestrictive;
-      }
-
-      const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-      const userRatingIndex = ratingHierarchy.indexOf(userRating);
-      const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-      if (userRatingIndex === -1) return true;
-      if (resultRatingIndex === -1) return true;
-
-      return resultRatingIndex <= userRatingIndex;
-    });
-
-    logger.debug(`TVDB filtered ${finalResults.length} results to ${ageFilteredResults.length} based on age rating: ${config.ageRating}`);
-  }
+  const ageFilteredResults = sortedResults;
   logger.info(`TVDB search results completed in ${Date.now() - searchStartTime}ms`);
 
   return ageFilteredResults;
@@ -1464,39 +1690,7 @@ async function performTvdbPeopleSearch(type: string, query: string, language: st
   });
 
   const sortedResults = filteredResults.map((p: any) => p.originalItem);
-  let ageFilteredResults = sortedResults;
-  if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-    const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-    const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-    const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-    ageFilteredResults = sortedResults.filter((result: any) => {
-      const cert = result.certification;
-
-      const isTvRating = type === 'series';
-      const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-      const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                     (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                      movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                     (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                      tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-      if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-        return !isUserRatingRestrictive;
-      }
-
-      const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-      const userRatingIndex = ratingHierarchy.indexOf(userRating);
-      const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-      if (userRatingIndex === -1) return true;
-      if (resultRatingIndex === -1) return true;
-
-      return resultRatingIndex <= userRatingIndex;
-    });
-
-    logger.debug(`TVDB filtered ${finalResults.length} results to ${ageFilteredResults.length} based on age rating: ${config.ageRating}`);
-  }
+  const ageFilteredResults = sortedResults;
   logger.info(`TVDB people search results completed in ${Date.now() - searchStartTime}ms`);
 
   return ageFilteredResults;
@@ -1618,7 +1812,7 @@ async function parseTvmazeResult(show: any, config: any): Promise<any> {
     logo: logoUrl,
     year: show.premiered ? show.premiered.substring(0, 4) : '',
     released: show.premiered ? new Date(show.premiered) : undefined,
-    imdbRating: imdbId ? (await getImdbRating(imdbId, 'series')) : show.rating?.average ? show.rating.average.toFixed(1) : 'N/A',
+    imdbRating: (imdbId ? await getImdbRating(imdbId, 'series') : 'N/A') || 'N/A',
     _tmdbId: tmdbId ? String(tmdbId) : undefined,
     _tvdbId: tvdbId ? String(tvdbId) : undefined,
   };
@@ -1789,43 +1983,6 @@ async function performTraktSearch(type: string, query: string, language: string,
 
     let finalMetas = validMetas;
 
-    if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-      const beforeCount = finalMetas.length;
-      const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-      const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-      const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-      finalMetas = finalMetas.filter((result: any) => {
-        const cert = result.certification;
-
-        const isTvRating = type === 'series';
-        const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-        const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                       (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                       (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-        if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-          return !isUserRatingRestrictive;
-        }
-
-        const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-        const userRatingIndex = ratingHierarchy.indexOf(userRating);
-        const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-        if (userRatingIndex === -1) return true;
-        if (resultRatingIndex === -1) return true;
-
-        return resultRatingIndex <= userRatingIndex;
-      });
-
-      const afterCount = finalMetas.length;
-      if (beforeCount !== afterCount) {
-        logger.info(`Age rating filter (Trakt): filtered out ${beforeCount - afterCount} results`);
-      }
-    }
-
     if (type === 'movie' && config.hideUnreleasedDigitalSearch) {
       const beforeCount = finalMetas.length;
       finalMetas = finalMetas.filter((meta: any) => Utils.isReleasedDigitally(meta));
@@ -1892,7 +2049,19 @@ async function performMdbListSearch(type: string, query: string, language: strin
       config.apiKeys.mdblist
     );
 
-    const metas = await Promise.all(batchMediaInfo.map(async (media: any) => {
+    const byTmdbId = new Map<string, any>();
+    for (const media of batchMediaInfo) {
+      const id = media?.ids?.tmdb ?? media?.ids?.tmdbid;
+      if (id != null) byTmdbId.set(String(id), media);
+    }
+    const rankedMediaInfo = tmdbIds
+      .map((id: any) => byTmdbId.get(String(id)))
+      .filter(Boolean);
+    for (const media of batchMediaInfo) {
+      if (!rankedMediaInfo.includes(media)) rankedMediaInfo.push(media);
+    }
+
+    const metas = await Promise.all(rankedMediaInfo.map(async (media: any) => {
 
       let releaseDates: any = null;
       if (type === 'movie' && media.ids?.tmdb && config.hideUnreleasedDigitalSearch) {
@@ -1946,43 +2115,6 @@ async function performMdbListSearch(type: string, query: string, language: strin
     const validMetas = metas.filter(Boolean);
 
     let finalMetas = validMetas;
-
-    if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-      const beforeCount = finalMetas.length;
-      const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-      const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-      const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-      finalMetas = finalMetas.filter((result: any) => {
-        const cert = result.certification;
-
-        const isTvRating = type === 'series';
-        const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-        const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                       (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                       (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-        if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-          return !isUserRatingRestrictive;
-        }
-
-        const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-        const userRatingIndex = ratingHierarchy.indexOf(userRating);
-        const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-        if (userRatingIndex === -1) return true;
-        if (resultRatingIndex === -1) return true;
-
-        return resultRatingIndex <= userRatingIndex;
-      });
-
-      const afterCount = finalMetas.length;
-      if (beforeCount !== afterCount) {
-        logger.info(`Age rating filter (MDBList): filtered out ${beforeCount - afterCount} results`);
-      }
-    }
 
     if (type === 'movie' && config.hideUnreleasedDigitalSearch) {
       const beforeCount = finalMetas.length;
@@ -2203,43 +2335,6 @@ async function performTraktPeopleSearch(type: string, query: string, language: s
 
     let finalMetas = validMetas.map(({ _matchType, ...meta }: any) => meta);
 
-    if (config.ageRating && config.ageRating.toLowerCase() !== 'none') {
-      const beforeCount = finalMetas.length;
-      const movieRatingHierarchy = ['G', 'PG', 'PG-13', 'R', 'NC-17'];
-      const tvRatingHierarchy = ["TV-Y", "TV-Y7", "TV-G", "TV-PG", "TV-14", "TV-MA"];
-      const movieToTvMap: Record<string, string> = { 'G': 'TV-G', 'PG': 'TV-PG', 'PG-13': 'TV-14', 'R': 'TV-MA', 'NC-17': 'TV-MA' };
-
-      finalMetas = finalMetas.filter((result: any) => {
-        const cert = result.certification;
-
-        const isTvRating = type === 'series';
-        const userRating = isTvRating ? (movieToTvMap[config.ageRating] || config.ageRating) : config.ageRating;
-        const isUserRatingRestrictive = userRating === 'PG-13' ||
-                                       (movieRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        movieRatingHierarchy.indexOf(userRating) <= movieRatingHierarchy.indexOf('PG-13')) ||
-                                       (tvRatingHierarchy.indexOf(userRating) !== -1 &&
-                                        tvRatingHierarchy.indexOf(userRating) <= tvRatingHierarchy.indexOf('TV-14'));
-
-        if (!cert || cert === "" || cert.toLowerCase() === 'nr') {
-          return !isUserRatingRestrictive;
-        }
-
-        const ratingHierarchy = isTvRating ? tvRatingHierarchy : movieRatingHierarchy;
-        const userRatingIndex = ratingHierarchy.indexOf(userRating);
-        const resultRatingIndex = ratingHierarchy.indexOf(cert);
-
-        if (userRatingIndex === -1) return true;
-        if (resultRatingIndex === -1) return true;
-
-        return resultRatingIndex <= userRatingIndex;
-      });
-
-      const afterCount = finalMetas.length;
-      if (beforeCount !== afterCount) {
-        logger.info(`Age rating filter (Trakt): filtered out ${beforeCount - afterCount} results`);
-      }
-    }
-
     if (type === 'movie' && config.hideUnreleasedDigitalSearch) {
       const beforeCount = finalMetas.length;
       finalMetas = finalMetas.filter((meta: any) => Utils.isReleasedDigitally(meta));
@@ -2273,6 +2368,12 @@ function getProviderFromSearchId(searchId: string): string {
     return 'trakt';
   } else if (searchId.includes('mdblist.')) {
     return 'mdblist';
+  } else if (searchId.includes('simkl.')) {
+    return 'simkl';
+  } else if (searchId.includes('imdb.')) {
+    return 'imdb';
+  } else if (searchId.includes('gemini.')) {
+    return 'ai';
   } else if (searchId === 'people_search') {
     return 'people_search';
   } else if (searchId === 'search') {
@@ -2376,6 +2477,15 @@ async function getSearch(id: string, type: string, language: string, extra: any,
           }
 
           providerId = providerId || getDefaultProvider(type);
+
+          // A config saved while Simkl search was on keeps naming it, and the
+          // configure page only rewrites that the next time its owner opens it.
+          if (SIMKL_SEARCH_PROVIDERS.has(providerId) && isSimklSearchDisabled()) {
+            const fallback = getDefaultProvider(type);
+            logger.info(`Simkl search is off on this instance, falling back to '${fallback}' for "${query}"`);
+            providerId = fallback;
+          }
+
           logger.debug(`Performing direct keyword search for type '${type}' using provider '${providerId}'`);
 
           switch (providerId) {
@@ -2390,6 +2500,12 @@ async function getSearch(id: string, type: string, language: string, extra: any,
                 break;
               case 'kitsu.search.movie':
                 metas = await performKitsuSearch('movie', query, language, config, page);
+                break;
+              case 'simkl.search.series':
+                metas = await performSimklAnimeSearch('series', query, language, config, page);
+                break;
+              case 'simkl.search.movie':
+                metas = await performSimklAnimeSearch('movie', query, language, config, page);
                 break;
               case 'tmdb.search':
                 metas = await performTmdbSearch(type, query, language, config, false, page);
@@ -2408,6 +2524,12 @@ async function getSearch(id: string, type: string, language: string, extra: any,
                 break;
               case 'mdblist.search':
                 metas = await performMdbListSearch(type, query, language, config);
+                break;
+              case 'imdb.suggestions.search':
+                metas = await performImdbSuggestionSearch(type, query, language, config);
+                break;
+              case 'simkl.search':
+                metas = await performSimklSearch(type, query, language, config, page);
                 break;
           }
         }
@@ -2443,6 +2565,8 @@ async function getSearch(id: string, type: string, language: string, extra: any,
         else if (providerId.includes('tvmaze.')) actualProvider = 'tvmaze';
         else if (providerId.includes('trakt.')) actualProvider = 'trakt';
         else if (providerId.includes('mdblist.')) actualProvider = 'mdblist';
+        else if (providerId.includes('simkl.')) actualProvider = 'simkl';
+        else if (providerId.includes('imdb.')) actualProvider = 'imdb';
       }
     }
 
@@ -2510,6 +2634,8 @@ async function getSearch(id: string, type: string, language: string, extra: any,
         else if (providerId.includes('tvmaze.')) actualProvider = 'tvmaze';
         else if (providerId.includes('trakt.')) actualProvider = 'trakt';
         else if (providerId.includes('mdblist.')) actualProvider = 'mdblist';
+        else if (providerId.includes('simkl.')) actualProvider = 'simkl';
+        else if (providerId.includes('imdb.')) actualProvider = 'imdb';
       }
     }
 

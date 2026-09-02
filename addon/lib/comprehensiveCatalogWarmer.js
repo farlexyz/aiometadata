@@ -1,46 +1,34 @@
 require('dotenv').config();
 const {
   cacheWrapCatalog,
+  cacheWrapGlobal,
   cacheWrapJikanApi,
   stableStringify,
   projectCatalogPayloadForCache,
   writeMetaComponentsBatchWithConfig,
 } = require('./getCache');
+const { sleep } = require('../utils/concurrency');
 const { getGenreList } = require('./getGenreList');
 const { parseAnimeCatalogMetaBatch } = require('../utils/parseProps');
+const { envInt } = require('../utils/envNumber');
 const jikan = require('./mal');
+const { buildProxyArtUrl } = require('./posterCache/proxyArt.js');
+const movielens = require('./movielens');
 const database = require('./database');
 const redis = require('./redisClient');
+/** Slack for clock skew, so a key already sitting on the target is left alone. */
+const EXPIRY_TOLERANCE_MS = 1000;
 const consola = require('consola');
 const { loadConfigFromDatabase } = require('./configApi.js');
-const { resolveDynamicTmdbDiscoverParams } = require('./tmdbDiscoverDateTokens');
+const { isDiscoverCatalogId, applyDiscoverSignature } = require('./discoverCatalogSignature');
+const { markWarmRunStarted, markWarmRunFinished } = require('./catalogWarmWindow');
+const { supportsMdblistScoreFilters } = require('../utils/mdbList');
 const { getTvmazeScheduleCatalog } = require('./tvmazeScheduleCatalog');
-const buildInfo = require('./buildInfo');
-const crypto = require('crypto');
 const { runWithRequestContext } = require('./logBuffer.js');
+const posterCacheConfig = require('./posterCache/config.js');
+const { collectWarmupTargets, extractIdsFromWarmerMeta } = require('./warmupTargets.js');
+const imageWarmQueue = require('./posterCache/warmQueue.js');
 
-function extractIdsFromWarmerMeta(meta) {
-  const ids = {};
-  if (!meta) return ids;
-  const id = meta.id || '';
-  if (id) ids.id = id;
-  if (id.startsWith('tmdb:')) ids.tmdbId = id.slice(5);
-  else if (id.startsWith('tvdb:')) ids.tvdbId = id.slice(5);
-  else if (id.startsWith('kitsu:')) ids.kitsuId = id.slice(6);
-  else if (id.startsWith('mal:')) ids.malId = id.slice(4);
-  else if (id.startsWith('anilist:')) ids.anilistId = id.slice(8);
-  else if (id.startsWith('anidb:')) ids.anidbId = id.slice(6);
-  else if (id.startsWith('tt')) ids.imdbId = id;
-  if (meta.imdb_id) ids.imdbId = meta.imdb_id;
-  if (meta._tmdbId && !ids.tmdbId) ids.tmdbId = meta._tmdbId;
-  if (meta._tvdbId && !ids.tvdbId) ids.tvdbId = meta._tvdbId;
-  if (meta._imdbId && !ids.imdbId) ids.imdbId = meta._imdbId;
-  if (meta._malId && !ids.malId) ids.malId = meta._malId;
-  if (meta._kitsuId && !ids.kitsuId) ids.kitsuId = meta._kitsuId;
-  if (meta._anilistId && !ids.anilistId) ids.anilistId = meta._anilistId;
-  if (meta._anidbId && !ids.anidbId) ids.anidbId = meta._anidbId;
-  return ids;
-}
 
 const logger = consola.create({
   defaults: {
@@ -49,7 +37,7 @@ const logger = consola.create({
 });
 
 // Configuration from environment variables
-const WARMUP_MODE = process.env.CACHE_WARMUP_MODE || 'essential'; // 'essential', 'comprehensive'
+const warmupMode = () => process.env.CACHE_WARMUP_MODE || 'essential'; // 'essential', 'comprehensive'
 
 // Parse UUIDs from environment variable (supports single UUID or comma-separated list)
 const parseWarmupUUIDs = () => {
@@ -61,17 +49,18 @@ const parseWarmupUUIDs = () => {
 };
 
 const WARMUP_CONFIG = {
-  enabled: !!(process.env.CACHE_WARMUP_UUIDS || process.env.CACHE_WARMUP_UUID) && WARMUP_MODE === 'comprehensive',
+  enabled: !!(process.env.CACHE_WARMUP_UUIDS || process.env.CACHE_WARMUP_UUID) && warmupMode() === 'comprehensive',
   uuids: parseWarmupUUIDs(),
   intervalHours: Math.max(12, parseFloat(process.env.CATALOG_WARMUP_INTERVAL_HOURS) || 24), // Daily default, minimum 12h (supports fractional hours like 0.5)
-  initialDelaySeconds: parseInt(process.env.CATALOG_WARMUP_INITIAL_DELAY_SECONDS) || 300,
-  maxPagesPerCatalog: parseInt(process.env.CATALOG_WARMUP_MAX_PAGES_PER_CATALOG) || 100,
+  initialDelaySeconds: envInt('CATALOG_WARMUP_INITIAL_DELAY_SECONDS', 300),
+  maxPagesPerCatalog: envInt('CATALOG_WARMUP_MAX_PAGES_PER_CATALOG', 100),
   resumeOnRestart: process.env.CATALOG_WARMUP_RESUME_ON_RESTART !== 'false',
   quietHoursEnabled: process.env.CATALOG_WARMUP_QUIET_HOURS_ENABLED === 'true',
   quietHoursRange: process.env.CATALOG_WARMUP_QUIET_HOURS || '02:00-06:00',
-  taskDelayMs: parseInt(process.env.CATALOG_WARMUP_TASK_DELAY_MS) || 100,
+  taskDelayMs: envInt('CATALOG_WARMUP_TASK_DELAY_MS', 100),
   logLevel: process.env.CATALOG_WARMUP_LOG_LEVEL || 'info',
-  autoOnVersionChange: process.env.CATALOG_WARMUP_AUTO_ON_VERSION_CHANGE === 'true'
+  autoOnEpochChange: (process.env.CATALOG_WARMUP_AUTO_ON_EPOCH_CHANGE
+    ?? process.env.CATALOG_WARMUP_AUTO_ON_VERSION_CHANGE) === 'true'
 };
 
 // Stats tracking - now supports multiple UUIDs
@@ -85,6 +74,7 @@ let warmupStats = {
   totalCatalogs: 0,
   catalogsWarmed: 0,
   totalPages: 0,
+  pagesFromCache: 0,
   totalItems: 0,
   duration: null,
   errors: []
@@ -103,6 +93,7 @@ class ComprehensiveCatalogWarmer {
       totalCatalogs: 0,
       catalogsWarmed: 0,
       totalPages: 0,
+      pagesFromCache: 0,
       totalItems: 0,
       duration: null,
       errors: []
@@ -128,6 +119,27 @@ class ComprehensiveCatalogWarmer {
    */
   shouldContinueWarming() {
     return !this.shouldStop;
+  }
+
+  /**
+   * Recompute env-derived config from the live process.env. This module is
+   * imported before dashboard settings are loaded from the database into
+   * process.env, so the import-time WARMUP_CONFIG can be stale when values
+   * are configured via the dashboard rather than env vars.
+   */
+  syncConfigFromEnv() {
+    this.config.uuids = parseWarmupUUIDs();
+    this.config.enabled = !!(process.env.CACHE_WARMUP_UUIDS || process.env.CACHE_WARMUP_UUID) && (process.env.CACHE_WARMUP_MODE || 'essential') === 'comprehensive';
+    this.config.intervalHours = Math.max(12, parseFloat(process.env.CATALOG_WARMUP_INTERVAL_HOURS) || 24);
+    this.config.maxPagesPerCatalog = envInt('CATALOG_WARMUP_MAX_PAGES_PER_CATALOG', 100);
+    this.config.quietHoursEnabled = process.env.CATALOG_WARMUP_QUIET_HOURS_ENABLED === 'true';
+    this.config.quietHoursRange = process.env.CATALOG_WARMUP_QUIET_HOURS || '02:00-06:00';
+    this.config.taskDelayMs = envInt('CATALOG_WARMUP_TASK_DELAY_MS', 100);
+    this.config.logLevel = process.env.CATALOG_WARMUP_LOG_LEVEL || 'info';
+    this.config.autoOnEpochChange = (process.env.CATALOG_WARMUP_AUTO_ON_EPOCH_CHANGE
+      ?? process.env.CATALOG_WARMUP_AUTO_ON_VERSION_CHANGE) === 'true';
+    this.stats.enabled = this.config.enabled;
+    this.stats.totalUUIDs = this.config.uuids.length;
   }
 
   log(level, message) {
@@ -172,7 +184,7 @@ class ComprehensiveCatalogWarmer {
   }
 
   async delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return sleep(ms);
   }
 
   isQuietHours() {
@@ -222,15 +234,16 @@ class ComprehensiveCatalogWarmer {
     }
   }
 
-  async markWarmed(uuid, runStartedAt = null) {
+  async markWarmed(uuid, runStartedAt = null, stampSchedule = true) {
     try {
       const lastWarmupKey = `catalog-warmup:last-run:${uuid}`;
       const statsKey = `catalog-warmup:stats:${uuid}`;
       const recordedStart = typeof runStartedAt === 'number' ? runStartedAt : Date.now();
-      
-      // Save timestamp for this specific UUID
-      await redis.set(lastWarmupKey, recordedStart.toString());
-      
+
+      if (stampSchedule) {
+        await redis.set(lastWarmupKey, recordedStart.toString());
+      }
+
       // Save stats for this UUID
       await redis.set(statsKey, JSON.stringify({
         catalogsWarmed: this.stats.uuidStats[uuid]?.catalogsWarmed || 0,
@@ -240,12 +253,110 @@ class ComprehensiveCatalogWarmer {
         duration: this.stats.uuidStats[uuid]?.duration || null,
         errors: this.stats.uuidStats[uuid]?.errors || []
       }));
-      
+
+      if (!stampSchedule) {
+        this.log('info', `UUID ${uuid} images warmed, leaving its warmup schedule where it was`);
+        return;
+      }
+
       const nextRunTime = recordedStart + (this.config.intervalHours * 60 * 60 * 1000);
       this.stats.nextRun = new Date(nextRunTime).toISOString();
       this.log('debug', `Marked warmup complete for UUID ${uuid}, next run: ${this.formatNextRunTime(nextRunTime)}`);
     } catch (error) {
       this.log('error', `Failed to mark warmup complete for UUID ${uuid}: ${error.message}`);
+    }
+  }
+
+  /**
+   * Pull every catalog key in to expire just before the next warm run.
+   * A key that outlives the run is handed back as a cache hit, keeps the expiry it
+   * already had and dies mid-interval with nothing scheduled to refetch it. Adding a
+   * catalog between runs is the usual way to end up there. TTLs are only shortened,
+   * never extended, so nothing is kept alive past what it was already given.
+   */
+  async syncCatalogTtlToSchedule() {
+    if (!redis) return { success: false, message: 'Redis is not available' };
+
+    this.syncConfigFromEnv();
+
+    if (!this.config.enabled) {
+      return { success: false, message: 'Comprehensive catalog warming is disabled' };
+    }
+    if (this.isRunning) {
+      return { success: false, message: 'Warmup is running, sync once it finishes' };
+    }
+    if (!this.config.uuids || this.config.uuids.length === 0) {
+      return { success: false, message: 'CACHE_WARMUP_UUIDS is not set' };
+    }
+
+    try {
+      const intervalMs = this.config.intervalHours * 60 * 60 * 1000;
+      let nextRun = null;
+
+      for (const uuid of this.config.uuids) {
+        const lastRun = await redis.get(`catalog-warmup:last-run:${uuid}`);
+        if (!lastRun) {
+          nextRun = null;
+          break;
+        }
+        const due = parseInt(lastRun, 10) + intervalMs;
+        if (nextRun === null || due < nextRun) nextRun = due;
+      }
+
+      const msUntilNextRun = nextRun === null ? 0 : nextRun - Date.now();
+      if (msUntilNextRun <= 1000) {
+        return { success: false, message: 'A warm run is already due, nothing to line up' };
+      }
+
+      const targetAt = nextRun - EXPIRY_TOLERANCE_MS;
+      const { getCacheEpoch } = require('./cacheEpoch');
+      const pattern = `e${getCacheEpoch()}:catalog:*`;
+
+      let scanned = 0;
+      let adjusted = 0;
+      let cursor = '0';
+
+      do {
+        const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+        cursor = next;
+        if (!keys || keys.length === 0) continue;
+        scanned += keys.length;
+
+        const ttls = await redis.pipeline(keys.map((k) => ['pttl', k])).exec();
+        // Read the clock next to the reply the TTLs came back in, so the round trip
+        // is not mistaken for the key expiring late.
+        const readAt = Date.now();
+        const pipeline = redis.pipeline();
+        let queued = 0;
+
+        keys.forEach((key, i) => {
+          const pttl = ttls?.[i]?.[1];
+          if (typeof pttl !== 'number' || pttl <= 0) return;
+          if (readAt + pttl <= targetAt + EXPIRY_TOLERANCE_MS) return;
+          pipeline.pexpireat(key, targetAt);
+          queued++;
+        });
+
+        if (queued > 0) {
+          await pipeline.exec();
+          adjusted += queued;
+        }
+      } while (cursor !== '0');
+
+      const due = this.formatNextRunTime(nextRun);
+      this.log('success', `Lined up ${adjusted} of ${scanned} catalog keys to expire before the next warmup ${due}`);
+      return {
+        success: true,
+        message: adjusted > 0
+          ? `Lined up ${adjusted} of ${scanned} catalog keys to expire before the next warmup ${due}`
+          : `All ${scanned} catalog keys already expire before the next warmup ${due}`,
+        scanned,
+        adjusted,
+        nextRun: new Date(nextRun).toISOString(),
+      };
+    } catch (error) {
+      this.log('error', `Failed to sync catalog TTLs to the schedule: ${error.message}`);
+      return { success: false, message: `Failed to sync catalog TTLs: ${error.message}` };
     }
   }
 
@@ -280,7 +391,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.airing': {
         const animeResults = await cacheWrapJikanApi(`mal-airing-${page}-${config.sfw}`, async () => {
           return await jikan.getAiringNow(page, config);
-        }, 24 * 60 * 60, { skipVersion: true });
+        }, 24 * 60 * 60);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -296,7 +407,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.top_movies': {
         const animeResults = await cacheWrapJikanApi(`mal-top-movies-${page}-${config.sfw}`, async () => {
           return await jikan.getTopAnimeByType('movie', page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -304,7 +415,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.top_series': {
         const animeResults = await cacheWrapJikanApi(`mal-top-series-${page}-${config.sfw}`, async () => {
           return await jikan.getTopAnimeByType('tv', page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -312,7 +423,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.most_popular': {
         const animeResults = await cacheWrapJikanApi(`mal-most-popular-${page}-${config.sfw}`, async () => {
           return await jikan.getTopAnimeByFilter('bypopularity', page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -320,7 +431,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.most_favorites': {
         const animeResults = await cacheWrapJikanApi(`mal-most-favorites-${page}-${config.sfw}`, async () => {
           return await jikan.getTopAnimeByFilter('favorite', page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -328,7 +439,23 @@ class ComprehensiveCatalogWarmer {
       case 'mal.top_anime': {
         const animeResults = await cacheWrapJikanApi(`mal-top-anime-${page}-${config.sfw}`, async () => {
           return await jikan.getTopAnimeByType('anime', page, config);
-        }, null, { skipVersion: true });
+        }, null);
+        metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
+        break;
+      }
+
+      case 'mal.season_top': {
+        const animeResults = await cacheWrapJikanApi(`mal-season-top-${page}-${config.sfw}`, async () => {
+          return await jikan.getSeasonTopRated(page, config);
+        }, 24 * 60 * 60);
+        metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
+        break;
+      }
+
+      case 'mal.season_top_new': {
+        const animeResults = await cacheWrapJikanApi(`mal-season-top-new-${page}-${config.sfw}`, async () => {
+          return await jikan.getSeasonTopNew(page, config);
+        }, 24 * 60 * 60);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -349,7 +476,7 @@ class ComprehensiveCatalogWarmer {
         const allAnimeGenres = await cacheWrapJikanApi('anime-genres', async () => {
           this.log('debug', 'Fetching anime genre list from Jikan...');
           return await jikan.getAnimeGenres();
-        }, null, { skipVersion: true });
+        }, null);
         const genreNameToFetch = genreName && genreName !== 'None' ? genreName : allAnimeGenres[0]?.name;
         if (genreNameToFetch) {
           const selectedGenre = allAnimeGenres.find(g => g.name === genreNameToFetch);
@@ -357,7 +484,7 @@ class ComprehensiveCatalogWarmer {
             const genreId = selectedGenre.mal_id;
             const animeResults = await cacheWrapJikanApi(`mal-decade-${catalogId}-${page}-${genreId}-${config.sfw}`, async () => {
               return await jikan.getTopAnimeByDateRange(startDate, endDate, page, genreId, config);
-            }, null, { skipVersion: true });
+            }, null);
             metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
           }
         }
@@ -365,19 +492,19 @@ class ComprehensiveCatalogWarmer {
       }
 
       case 'mal.genres': {
-        const mediaType = type_filter || 'series';
+        const mediaType = type_filter || null;
         const allAnimeGenres = await cacheWrapJikanApi('anime-genres', async () => {
           this.log('debug', 'Fetching anime genre list from Jikan...');
           return await jikan.getAnimeGenres();
-        }, null, { skipVersion: true });
+        }, null);
         const genreNameToFetch = genreName || allAnimeGenres[0]?.name;
         if (genreNameToFetch) {
           const selectedGenre = allAnimeGenres.find(g => g.name === genreNameToFetch);
           if (selectedGenre) {
             const genreId = selectedGenre.mal_id;
-            const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType}-${page}-${config.sfw}`, async () => {
+            const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType || 'all'}-${page}-${config.sfw}`, async () => {
               return await jikan.getAnimeByGenre(genreId, mediaType, page, config);
-            }, null, { skipVersion: true });
+            }, null);
             metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
           }
         }
@@ -387,7 +514,7 @@ class ComprehensiveCatalogWarmer {
       case 'mal.studios': {
         if (genreName) {
           this.log('debug', `Fetching anime for MAL studio: ${genreName}`);
-          const studios = await cacheWrapJikanApi('mal-studios', () => jikan.getStudios(100), null, { skipVersion: true });
+          const studios = await cacheWrapJikanApi('mal-studios', () => jikan.getStudios(100), null);
           const selectedStudio = studios.find(studio => {
             const defaultTitle = studio.titles.find(t => t.type === 'Default');
             return defaultTitle && defaultTitle.title === genreName;
@@ -397,7 +524,7 @@ class ComprehensiveCatalogWarmer {
             const studioId = selectedStudio.mal_id;
             const animeResults = await cacheWrapJikanApi(`mal-studio-${studioId}-${page}-${config.sfw}`, async () => {
               return await jikan.getAnimeByStudio(studioId, page);
-            }, null, { skipVersion: true });
+            }, null);
             metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
           } else {
             this.log('warn', `Could not find a MAL ID for studio name: ${genreName}`);
@@ -410,7 +537,7 @@ class ComprehensiveCatalogWarmer {
         const dayOfWeek = genreName || 'Monday';
         const animeResults = await cacheWrapJikanApi(`mal-schedule-${dayOfWeek}-${page}-${config.sfw}`, async () => {
           return await jikan.getAiringSchedule(dayOfWeek, page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -438,7 +565,7 @@ class ComprehensiveCatalogWarmer {
         const year = parseInt(parts[1]);
         const animeResults = await cacheWrapJikanApi(`mal-season-${year}-${season}-${page}-${config.sfw}`, async () => {
           return await jikan.getAnimeBySeason(year, season, page, config);
-        }, null, { skipVersion: true });
+        }, null);
         metas = await parseAnimeCatalogMetaBatch(animeResults, config, language, true);
         break;
       }
@@ -473,9 +600,12 @@ class ComprehensiveCatalogWarmer {
         catalogId.startsWith('custom.') ||
         catalogId.startsWith('streaming.') ||
         catalogId.startsWith('simkl.') ||
+        catalogId.startsWith('movielens.') ||
         catalogId.startsWith('publicmetadb.') ||
         catalogId.startsWith('tmdb.discover') ||
+        catalogId.startsWith('tmdb.collection.') ||
         catalogId.startsWith('tvdb.discover') ||
+        catalogId.startsWith('tvdb.list.') ||
         catalogId.startsWith('mal.discover')  ||
         catalogId.startsWith('anilist.discover') ||
         catalogId === 'tmdb.top' ||
@@ -543,7 +673,7 @@ class ComprehensiveCatalogWarmer {
       } else if (catalogId === 'mal.genres') {
         try {
           // Use the same cache key as getManifest for available anime genres
-          const animeGenres = await cacheWrapJikanApi('anime-genres', async () => await jikan.getAnimeGenres(), 30 * 24 * 60 * 60, { skipVersion: true });
+          const animeGenres = await cacheWrapJikanApi('anime-genres', async () => await jikan.getAnimeGenres(), 30 * 24 * 60 * 60);
           if (animeGenres && animeGenres.length > 0) {
             let animeGenreNames = animeGenres.filter(Boolean).map(genre => genre.name).sort();
             if (animeGenreNames.length > 0) {
@@ -569,7 +699,6 @@ class ComprehensiveCatalogWarmer {
     let currentPage = 1;
     let totalItems = 0;
     const maxPages = this.config.maxPagesPerCatalog;
-    let posterWarmingChain = Promise.resolve();
 
     while (currentPage <= maxPages) {
       try {
@@ -578,35 +707,36 @@ class ComprehensiveCatalogWarmer {
         if (currentPage > 1) extraArgs.page = currentPage;
         if (genreValue) extraArgs.genre = genreValue;
         const catalogConfig = config.catalogs?.find(c => c.id === catalogId);
-        if (catalogId.startsWith('trakt.') || catalogId.startsWith('anilist.') || catalogId.startsWith('streaming.') || catalogId.startsWith('tmdb.year') || catalogId.startsWith('tmdb.language')) {
+        // Claimed before the provider prefixes; anilist.discover would otherwise match anilist.
+        if (isDiscoverCatalogId(catalogId)) {
+          applyDiscoverSignature(extraArgs, catalogConfig);
+        }
+        else if (catalogId.startsWith('trakt.') || catalogId.startsWith('anilist.') || catalogId.startsWith('streaming.') || catalogId.startsWith('tmdb.year') || catalogId.startsWith('tmdb.language')) {
           if (catalogConfig) {
             if (catalogConfig.sort) extraArgs.sort = catalogConfig.sort;
             if (catalogConfig.sortDirection) extraArgs.sortDirection = catalogConfig.sortDirection;
           }
         }
-        else if (catalogId.startsWith('tmdb.discover.') || catalogId.startsWith('tvdb.discover.') || catalogId.startsWith('simkl.discover.') || catalogId.startsWith('anilist.discover.') || catalogId.startsWith('mal.discover.')) {
-          const discoverParams =
-            catalogConfig?.metadata?.discover?.params ||
-            catalogConfig?.metadata?.discoverParams ||
-            null;
-          if (discoverParams && typeof discoverParams === 'object') {
-            const discoverParamsForSignature = catalogId.startsWith('tmdb.discover.')
-              ? resolveDynamicTmdbDiscoverParams(discoverParams, { timezone: config.timezone })
-              : discoverParams;
-            const discoverSignature = crypto
-              .createHash('md5')
-              .update(stableStringify(discoverParamsForSignature))
-              .digest('hex')
-              .substring(0, 8);
-            extraArgs.discoverSig = discoverSignature;
-          }
+        else if (catalogId.startsWith('mal.userlist.')) {
+          if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
+        }
+        else if (catalogId.startsWith('movielens.')) {
+          const mlMeta = catalogConfig?.metadata || {};
+          if (mlMeta.sortBy) extraArgs.sort = mlMeta.sortBy;
+          if (mlMeta.sortDirection) extraArgs.sortDirection = mlMeta.sortDirection;
+          if (mlMeta.tags) extraArgs.tags = mlMeta.tags;
+          if (mlMeta.minYear) extraArgs.minYear = mlMeta.minYear;
+          if (mlMeta.maxYear) extraArgs.maxYear = mlMeta.maxYear;
+          if (mlMeta.minPop) extraArgs.minPop = mlMeta.minPop;
+          if (mlMeta.maxDaysAgo) extraArgs.maxDaysAgo = mlMeta.maxDaysAgo;
+          if (mlMeta.maxFutureDays !== undefined) extraArgs.maxFutureDays = mlMeta.maxFutureDays;
+          if (mlMeta.includeRated) extraArgs.includeRated = true;
         }
         else if (catalogId.startsWith('mdblist.')) {
           if (catalogConfig) {
             if (catalogConfig.sort) extraArgs.sort = catalogConfig.sort;
             if (catalogConfig.order) extraArgs.order = catalogConfig.order;
-            // Add score filters for MDBList external lists
-            if (catalogConfig.source === 'mdblist' && catalogConfig.sourceUrl && catalogConfig.sourceUrl.includes('/external/lists/')) {
+            if (supportsMdblistScoreFilters(catalogConfig)) {
               if (typeof catalogConfig.filter_score_min === 'number') {
                 extraArgs.filter_score_min = catalogConfig.filter_score_min;
               }
@@ -616,7 +746,7 @@ class ComprehensiveCatalogWarmer {
             }
           }
         }
-        if (catalogId === 'trakt.upnext' || catalogId === 'mdblist.upnext' || catalogId === 'publicmetadb.upnext') {
+        if (catalogId === 'trakt.upnext' || catalogId === 'mdblist.upnext' || catalogId === 'publicmetadb.upnext' || catalogId.startsWith('simkl.upnext')) {
           extraArgs.useShowPoster = typeof catalogConfig?.metadata?.useShowPosterForUpNext === 'boolean'
               ? catalogConfig.metadata.useShowPosterForUpNext
               : false;
@@ -625,6 +755,9 @@ class ComprehensiveCatalogWarmer {
           if (catalogConfig?.metadata?.hideUnreleased !== undefined) {
             extraArgs.hideUnreleased = catalogConfig.metadata.hideUnreleased;
           }
+        }
+        if (catalogId === 'simkl.upnext') {
+          extraArgs.includeAnime = catalogConfig?.metadata?.includeAnimeInUpNext !== false;
         }
 
         if (catalogId === 'trakt.calendar') {
@@ -660,6 +793,55 @@ class ComprehensiveCatalogWarmer {
           const dateString = extraArgs.date || getTodayInTimezone(getUserTimezone());
           extraArgs.date = dateString;
           extraArgs.genre = !extraArgs.genre || extraArgs.genre === 'None' ? '' : extraArgs.genre.toUpperCase();
+        }
+
+        if (catalogId.startsWith('simkl.watchlist.') || catalogId.startsWith('simkl.upnext')) {
+          try {
+            const { getSimklToken, getSimklActivityFingerprint } = require('../utils/simklUtils');
+            const tokenId = config.apiKeys?.simklTokenId;
+            if (tokenId) {
+              const token = await getSimklToken(tokenId);
+              if (token?.access_token) {
+                let pairs;
+                if (catalogId === 'simkl.upnext.anime') {
+                  pairs = [['anime', 'watching']];
+                } else if (catalogId === 'simkl.upnext') {
+                  pairs = extraArgs.includeAnime === false
+                    ? [['shows', 'watching']]
+                    : [['shows', 'watching'], ['anime', 'watching']];
+                } else {
+                  const parts = catalogId.split('.');
+                  pairs = [[parts[2], parts[3]]];
+                }
+                const fps = await Promise.all(
+                  pairs.map(([t, st]) => getSimklActivityFingerprint(token.access_token, t, st))
+                );
+                const fp = fps.filter(Boolean).join('+');
+                if (fp) extraArgs._simklAct = fp;
+              }
+            }
+          } catch (e) {
+            this.log('warn', `Simkl activity fingerprint failed for ${catalogId}: ${e.message}`);
+          }
+        }
+
+        if (catalogId.startsWith('movielens.explore')) {
+          try {
+            const credId = config.apiKeys?.movieLensCredId;
+            const explicitTags = String(catalogConfig?.metadata?.tags || '')
+              .split(',').map(s => s.trim()).filter(Boolean).join(',');
+            if (credId && !explicitTags) {
+              const metaTtl = parseInt(
+                process.env.MOVIELENS_USERMETA_TTL_SECONDS || process.env.MOVIELENS_GROUPTAGS_TTL_SECONDS || '43200', 10);
+              const userMeta = await cacheWrapGlobal(`movielens-usermeta:${credId}`,
+                async () => movielens.getUserMeta(credId), metaTtl);
+              if (userMeta?.engineId === 'bard' && Array.isArray(userMeta.groupTags) && userMeta.groupTags.length) {
+                extraArgs._mlTags = userMeta.groupTags.map(t => t.trim()).filter(Boolean).join(',');
+              }
+            }
+          } catch (e) {
+            this.log('warn', `MovieLens group tags failed for ${catalogId}: ${e.message}`);
+          }
         }
 
           const derivedPage = currentPage;
@@ -709,59 +891,20 @@ class ComprehensiveCatalogWarmer {
               useShowPoster: !!extraArgs.useShowPoster,
             });
           }
-          }, { enableErrorCaching: false, maxRetries: 1, config });
+          }, {
+            enableErrorCaching: false,
+            maxRetries: 1,
+            config,
+            onHit: () => {
+              this.stats.pagesFromCache++;
+              if (this.stats.uuidStats[uuid]) this.stats.uuidStats[uuid].pagesFromCache++;
+            },
+          });
 
           const rawMetaCount = result?.metas?.length || 0;
 
-          const posterWarmupUrl = (process.env.POSTER_WARMUP_URL || process.env.POSTER_PROXY_PREFIX_URL || '').replace(/\/+$/, '');
-          if (posterWarmupUrl && rawMetaCount > 0) {
-            const { resolveCustomArtUrl, getDefaultPosterPattern, getPosterRatingApiKey, isRatingPostersEnabled } = require('../utils/parseProps');
-            const ratingPostersEnabled = isRatingPostersEnabled(config);
-            const posterPattern = ratingPostersEnabled ? (config.customPosterUrlPattern || (config.posterRatingProvider && config.posterRatingProvider !== 'custom' ? getDefaultPosterPattern(config.posterRatingProvider) : null)) : null;
-            const proxyApiKey = ratingPostersEnabled && config.usePosterProxy ? getPosterRatingApiKey(config) : null;
-            const addonHost = process.env.HOST_NAME ? (process.env.HOST_NAME.startsWith('http') ? process.env.HOST_NAME : `https://${process.env.HOST_NAME}`) : '';
-            const posterUrls = [];
-
-            for (const meta of result.metas) {
-              const ids = extractIdsFromWarmerMeta(meta);
-              const type = meta.type || catalog.type;
-              const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
-
-              if (posterPattern && proxyId) {
-                if (proxyApiKey) {
-                  posterUrls.push(`${addonHost}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&lang=${config.language || 'en-US'}&key=${proxyApiKey}`);
-                } else {
-                  const resolved = resolveCustomArtUrl(posterPattern, ids, type, config);
-                  if (resolved) {
-                    if (config.usePosterProxy) {
-                      posterUrls.push(`${addonHost}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&url=${encodeURIComponent(resolved)}`);
-                    } else {
-                      posterUrls.push(resolved);
-                    }
-                  }
-                }
-              } else if (meta.poster) {
-                posterUrls.push(meta.poster);
-              }
-            }
-
-            if (posterUrls.length > 0) {
-              const posterDelay = parseInt(process.env.POSTER_WARMUP_DELAY_MS) || 50;
-              const posterConcurrency = Math.max(1, parseInt(process.env.POSTER_WARMUP_CONCURRENCY) || 1);
-              const pageCatalogId = catalogId;
-              posterWarmingChain = posterWarmingChain.then(async () => {
-                let warmed = 0;
-                for (let i = 0; i < posterUrls.length; i += posterConcurrency) {
-                  const batch = posterUrls.slice(i, i + posterConcurrency);
-                  const results = await Promise.allSettled(
-                    batch.map(url => fetch(`${posterWarmupUrl}/${url}`, { method: 'HEAD' }))
-                  );
-                  warmed += results.filter(r => r.status === 'fulfilled').length;
-                  if (posterDelay > 0) await new Promise(r => setTimeout(r, posterDelay));
-                }
-                this.log('debug', `[Poster Warming] Pre-warmed ${warmed} poster images for catalog ${pageCatalogId}`);
-              });
-            }
+          if (rawMetaCount > 0) {
+            imageWarmQueue.offer(collectWarmupTargets(result.metas, config, catalog.type));
           }
 
           if (rawMetaCount === 0) {
@@ -789,7 +932,6 @@ class ComprehensiveCatalogWarmer {
     let currentSkip = 0;
     let pagesWarmed = 0;
     let totalItems = 0;
-    let posterWarmingChain = Promise.resolve();
 
     while (pagesWarmed < maxPages) {
       try {
@@ -798,54 +940,8 @@ class ComprehensiveCatalogWarmer {
 
         const rawMetaCount = result?.metas?.length || 0;
 
-        const posterWarmupUrl = (process.env.POSTER_WARMUP_URL || process.env.POSTER_PROXY_PREFIX_URL || '').replace(/\/+$/, '');
-        if (posterWarmupUrl && rawMetaCount > 0) {
-          const { resolveCustomArtUrl, getDefaultPosterPattern, getPosterRatingApiKey, isRatingPostersEnabled } = require('../utils/parseProps');
-          const ratingPostersEnabled = isRatingPostersEnabled(config);
-          const posterPattern = ratingPostersEnabled ? (config.customPosterUrlPattern || (config.posterRatingProvider && config.posterRatingProvider !== 'custom' ? getDefaultPosterPattern(config.posterRatingProvider) : null)) : null;
-          const proxyApiKey = ratingPostersEnabled && config.usePosterProxy ? getPosterRatingApiKey(config) : null;
-          const addonHost = process.env.HOST_NAME ? (process.env.HOST_NAME.startsWith('http') ? process.env.HOST_NAME : `https://${process.env.HOST_NAME}`) : '';
-          const posterUrls = [];
-
-          for (const meta of result.metas) {
-            const ids = extractIdsFromWarmerMeta(meta);
-            const type = meta.type || catalog.type;
-            const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
-
-            if (posterPattern && proxyId) {
-              if (proxyApiKey) {
-                posterUrls.push(`${addonHost}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&lang=${config.language || 'en-US'}&key=${proxyApiKey}`);
-              } else {
-                const resolved = resolveCustomArtUrl(posterPattern, ids, type, config);
-                if (resolved) {
-                  if (config.usePosterProxy) {
-                    posterUrls.push(`${addonHost}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&url=${encodeURIComponent(resolved)}`);
-                  } else {
-                    posterUrls.push(resolved);
-                  }
-                }
-              }
-            } else if (meta.poster) {
-              posterUrls.push(meta.poster);
-            }
-          }
-
-          if (posterUrls.length > 0) {
-            const posterDelay = parseInt(process.env.POSTER_WARMUP_DELAY_MS) || 50;
-            const posterConcurrency = Math.max(1, parseInt(process.env.POSTER_WARMUP_CONCURRENCY) || 1);
-            posterWarmingChain = posterWarmingChain.then(async () => {
-              let warmed = 0;
-              for (let i = 0; i < posterUrls.length; i += posterConcurrency) {
-                const batch = posterUrls.slice(i, i + posterConcurrency);
-                const results = await Promise.allSettled(
-                  batch.map(url => fetch(`${posterWarmupUrl}/${url}`, { method: 'HEAD' }))
-                );
-                warmed += results.filter(r => r.status === 'fulfilled').length;
-                if (posterDelay > 0) await new Promise(r => setTimeout(r, posterDelay));
-              }
-              this.log('debug', `[Poster Warming] Pre-warmed ${warmed} poster images for catalog ${catalogId}`);
-            });
-          }
+        if (rawMetaCount > 0) {
+          imageWarmQueue.offer(collectWarmupTargets(result.metas, config, catalog.type));
         }
 
         if (rawMetaCount === 0) {
@@ -875,21 +971,15 @@ class ComprehensiveCatalogWarmer {
     return { pages: pagesWarmed, items: totalItems };
   }
 
-  async runWarmup(force = false) {
+  async runWarmup(force = false, options = {}) {
+    const { imagesOnly = false } = options;
+
     if (this.isRunning) {
       this.log('warn', 'Warmup already running, skipping');
       return false;
     }
 
-    this.config.uuids = parseWarmupUUIDs();
-    this.config.enabled = !!(process.env.CACHE_WARMUP_UUIDS || process.env.CACHE_WARMUP_UUID) && (process.env.CACHE_WARMUP_MODE || 'essential') === 'comprehensive';
-    this.config.intervalHours = Math.max(12, parseFloat(process.env.CATALOG_WARMUP_INTERVAL_HOURS) || 24);
-    this.config.maxPagesPerCatalog = parseInt(process.env.CATALOG_WARMUP_MAX_PAGES_PER_CATALOG) || 100;
-    this.config.quietHoursEnabled = process.env.CATALOG_WARMUP_QUIET_HOURS_ENABLED === 'true';
-    this.config.quietHoursRange = process.env.CATALOG_WARMUP_QUIET_HOURS || '02:00-06:00';
-    this.config.taskDelayMs = parseInt(process.env.CATALOG_WARMUP_TASK_DELAY_MS) || 100;
-    this.config.logLevel = process.env.CATALOG_WARMUP_LOG_LEVEL || 'info';
-    this.config.autoOnVersionChange = process.env.CATALOG_WARMUP_AUTO_ON_VERSION_CHANGE === 'true';
+    this.syncConfigFromEnv();
 
     if (!this.config.enabled) {
       this.log('debug', 'Catalog warming is disabled');
@@ -907,6 +997,8 @@ class ComprehensiveCatalogWarmer {
       if (!shouldRun) {
         return false;
       }
+    } else if (imagesOnly) {
+      this.log('info', 'Image warm requested - catalogs are read back from cache and the schedule is left alone');
     } else {
       this.log('info', 'Force restart requested - bypassing interval check');
     }
@@ -919,6 +1011,7 @@ class ComprehensiveCatalogWarmer {
 
     // Reset stop flag at start
     this.shouldStop = false;
+    imageWarmQueue.resetStats();
     this.isRunning = true;
     this.stats.isRunning = true;
     this.stats.totalUUIDs = this.config.uuids.length;
@@ -945,9 +1038,9 @@ class ComprehensiveCatalogWarmer {
                 }
               }
             }
-            const skipIds = new Set(['trakt.upnext', 'mdblist.upnext', 'publicmetadb.upnext']);
+            const skipIds = new Set(['trakt.upnext', 'mdblist.upnext', 'publicmetadb.upnext', 'simkl.upnext', 'simkl.upnext.anime']);
             const enabledCatalogs = allCatalogs.filter(c =>
-              c.source !== 'merged' && !skipIds.has(c.id) &&
+              c.source !== 'merged' && !skipIds.has(c.id) && c.cacheTTL !== 0 &&
               (c.enabled || mergedChildIds.has(`${c.id}:${c.type}`))
             );
             userConfigs[uuid] = { config, enabledCatalogs };
@@ -958,6 +1051,7 @@ class ComprehensiveCatalogWarmer {
               totalCatalogs: enabledCatalogs.length,
               catalogsWarmed: 0,
               totalPages: 0,
+              pagesFromCache: 0,
               totalItems: 0,
               duration: null,
               errors: []
@@ -971,6 +1065,7 @@ class ComprehensiveCatalogWarmer {
       this.stats.totalCatalogs = grandTotalCatalogs;
       this.stats.catalogsWarmed = 0;
       this.stats.totalPages = 0;
+      this.stats.pagesFromCache = 0;
       this.stats.totalItems = 0;
       this.stats.errors = [];
 
@@ -992,9 +1087,14 @@ class ComprehensiveCatalogWarmer {
         const config = freshConfig;
 
         await runWithRequestContext(uuid, async () => {
+        const stampSchedule = !imagesOnly;
+        const uuidStartTime = Date.now();
+        // Published before the first catalog so the run's own writes anchor on it.
+        if (stampSchedule) {
+          await markWarmRunStarted(uuid, uuidStartTime);
+        }
         try {
           this.log('info', `Processing UUID: ${uuid} (${enabledCatalogs.length} catalogs)`);
-          const uuidStartTime = Date.now();
 
           let uuidWarmingInterrupted = false;
           for (const catalog of enabledCatalogs) {
@@ -1031,7 +1131,7 @@ class ComprehensiveCatalogWarmer {
           this.stats.uuidStats[uuid].duration = `${Math.floor(uuidDuration / 60000)}m ${Math.floor((uuidDuration % 60000) / 1000)}s`;
 
           if (!uuidWarmingInterrupted) {
-            await this.markWarmed(uuid, uuidStartTime);
+            await this.markWarmed(uuid, uuidStartTime, stampSchedule);
             this.log('success', `UUID ${uuid} complete: ${this.stats.uuidStats[uuid].catalogsWarmed}/${this.stats.uuidStats[uuid].totalCatalogs} catalogs, ${this.stats.uuidStats[uuid].totalPages} pages, ${this.stats.uuidStats[uuid].totalItems} items in ${this.stats.uuidStats[uuid].duration}`);
           } else {
             this.log('warn', `UUID ${uuid} interrupted: ${this.stats.uuidStats[uuid].catalogsWarmed}/${this.stats.uuidStats[uuid].totalCatalogs} catalogs warmed before stop`);
@@ -1039,6 +1139,10 @@ class ComprehensiveCatalogWarmer {
         } catch (error) {
           this.log('error', `Failed to process UUID ${uuid}: ${error.message}`);
           this.stats.errors.push({ uuid, error: error.message });
+        } finally {
+          if (stampSchedule) {
+            await markWarmRunFinished(uuid);
+          }
         }
         });
       }
@@ -1049,14 +1153,24 @@ class ComprehensiveCatalogWarmer {
       this.stats.lastRun = new Date(startTime).toISOString();
 
       const stoppedEarly = this.shouldStop;
-      this.log('success', `Warmup ${stoppedEarly ? 'stopped' : 'complete'}! Processed ${this.config.uuids.length} UUID(s), warmed ${this.stats.catalogsWarmed}/${this.stats.totalCatalogs} catalogs, ${this.stats.totalPages} pages, ${this.stats.totalItems} items in ${this.stats.duration}`);
+      const cachedPages = this.stats.pagesFromCache ? ` (${this.stats.pagesFromCache} already cached)` : '';
+      this.log('success', `Warmup ${stoppedEarly ? 'stopped' : 'complete'}! Processed ${this.config.uuids.length} UUID(s), warmed ${this.stats.catalogsWarmed}/${this.stats.totalCatalogs} catalogs, ${this.stats.totalPages} pages${cachedPages}, ${this.stats.totalItems} items in ${this.stats.duration}`);
+
+      const imageStats = imageWarmQueue.getStats();
+      if (imageStats.depth > 0) {
+        this.log('info', `Image warming: ${imageStats.depth} queued, ${imageStats.warmed} warmed, ${imageStats.skipped} already cached`);
+      }
       
-      // Update nextRun time after successful warmup (for both scheduled and forced runs)
+      if (imagesOnly) {
+        this.log('info', `Schedule unchanged, still due ${this.stats.nextRun ? this.formatNextRunTime(new Date(this.stats.nextRun).getTime()) : 'on the next check'}`);
+        return true;
+      }
+
       const intervalMs = this.config.intervalHours * 60 * 60 * 1000;
       const nextRunTime = startTime + intervalMs;
       this.stats.nextRun = new Date(nextRunTime).toISOString();
       this.log('info', `Next warmup scheduled for ${this.formatNextRunTime(nextRunTime)}`);
-      
+
       return true;
     } catch (error) {
       this.log('error', `Warmup failed: ${error.message}`);
@@ -1070,44 +1184,45 @@ class ComprehensiveCatalogWarmer {
     }
   }
 
-  async checkVersionAndWarmIfNeeded() {
-    if (!this.config.autoOnVersionChange) {
+  async checkEpochAndWarmIfNeeded() {
+    if (!this.config.autoOnEpochChange) {
       return false;
     }
 
-    const currentVersion = buildInfo.version;
-    const versionKey = 'catalog-warmup:last-version';
-    
+    const { getCacheEpoch } = require('./cacheEpoch');
+    const currentEpoch = String(getCacheEpoch());
+    const epochKey = 'catalog-warmup:last-epoch';
+
     try {
-      const lastVersion = await redis.get(versionKey);
-      
-      if (lastVersion && lastVersion !== currentVersion) {
-        this.log('success', `App version changed from ${lastVersion} to ${currentVersion} - triggering automatic warmup`);
-        // Run warmup immediately (force=true bypasses interval checks)
+      const lastEpoch = await redis.get(epochKey);
+
+      if (lastEpoch && lastEpoch !== currentEpoch) {
+        this.log('success', `Cache epoch changed from ${lastEpoch} to ${currentEpoch} - triggering automatic warmup`);
         const warmupCompleted = await this.runWarmup(true);
-        
+
         if (warmupCompleted) {
-          // Store new version after successful warmup
-          await redis.set(versionKey, currentVersion);
-          this.log('success', `Version change warmup completed. Updated stored version to ${currentVersion}`);
+          await redis.set(epochKey, currentEpoch);
+          this.log('success', `Epoch change warmup completed. Updated stored epoch to ${currentEpoch}`);
           return true;
         } else {
-          this.log('warn', 'Version change warmup was skipped or failed');
+          this.log('warn', 'Epoch change warmup was skipped or failed');
           return false;
         }
-      } else if (!lastVersion) {
-        await redis.set(versionKey, currentVersion);
-        this.log('info', `Storing initial app version: ${currentVersion}`);
+      } else if (!lastEpoch) {
+        await redis.set(epochKey, currentEpoch);
+        this.log('info', `Storing initial cache epoch: ${currentEpoch}`);
       }
-      
+
       return false;
     } catch (error) {
-      this.log('error', `Error checking version: ${error.message}`);
+      this.log('error', `Error checking cache epoch: ${error.message}`);
       return false;
     }
   }
 
   async startBackgroundWarming() {
+    this.syncConfigFromEnv();
+
     if (!process.env.CACHE_WARMUP_UUIDS && !process.env.CACHE_WARMUP_UUID) {
       this.log('info', 'Comprehensive catalog warming disabled - CACHE_WARMUP_UUIDS not set');
       return;
@@ -1122,11 +1237,19 @@ class ComprehensiveCatalogWarmer {
     this.log('success', `Comprehensive catalog warming enabled for ${this.config.uuids.length} UUID(s): ${this.config.uuids.join(', ')}`);
     this.log('info', `Interval: ${this.config.intervalHours}h, Initial delay: ${this.config.initialDelaySeconds}s`);
     
-    if (this.config.autoOnVersionChange) {
-      this.log('info', 'Auto-warmup on version change: enabled');
+    if (this.config.autoOnEpochChange) {
+      this.log('info', 'Auto-warmup on cache epoch change: enabled');
     }
 
-    const versionWarmupRan = await this.checkVersionAndWarmIfNeeded();
+    // The image cache index is rebuilt from disk in the background at startup.
+    // Until it lands, isCachedFresh() reports false for entries that are in fact
+    // on disk, so warming now would re-download art we already have.
+    const imageStore = require('./posterCache/store.js');
+    const waitedFrom = Date.now();
+    await imageStore.whenIndexed();
+    this.log('info', `Image cache index ready after ${Date.now() - waitedFrom}ms; starting warmup`);
+
+    const epochWarmupRan = await this.checkEpochAndWarmIfNeeded();
     
     // If version warmup ran, we still want to schedule the next regular warmup
     // Calculate next run time based on the earliest UUID that needs warming
@@ -1148,7 +1271,7 @@ class ComprehensiveCatalogWarmer {
       this.stats.nextRun = new Date(earliestNextRun).toISOString();
     }
 
-    if (!versionWarmupRan) {
+    if (!epochWarmupRan) {
       await this.delay(this.config.initialDelaySeconds * 1000);
     }
 
@@ -1191,6 +1314,7 @@ class ComprehensiveCatalogWarmer {
   }
 
   async getStats() {
+    this.syncConfigFromEnv();
     try {
       // Only load persisted stats if we don't have current stats (i.e., at startup)
       if (!this.stats || this.stats.totalCatalogs === 0) {
@@ -1290,6 +1414,14 @@ function forceRestartWarmup() {
   return warmer.runWarmup(true);
 }
 
+function forceWarmImages() {
+  return warmer.runWarmup(true, { imagesOnly: true });
+}
+
+function syncCatalogTtlToSchedule() {
+  return warmer.syncCatalogTtlToSchedule();
+}
+
 function stopComprehensiveWarming() {
   return warmer.stopWarming();
 }
@@ -1298,6 +1430,7 @@ module.exports = {
   startComprehensiveCatalogWarming,
   getWarmupStats,
   forceRestartWarmup,
+  forceWarmImages,
+  syncCatalogTtlToSchedule,
   stopComprehensiveWarming
 };
-

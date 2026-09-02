@@ -1,32 +1,46 @@
-import { lazy, Suspense, useState, useEffect, useMemo, type KeyboardEvent } from "react";
+import { lazy, Suspense, useState, useEffect, useMemo } from "react";
 import { useConfig } from "@/contexts/ConfigContext";
+import { useSave } from "@/contexts/SaveContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AlertCircle, AlertTriangle, CheckCircle, Copy, Loader2, Save, Key, User, Download, Eye, EyeOff, List } from "lucide-react";
+import { Copy, Loader2, Save, Key, User, Download, List } from "lucide-react";
 import { toast } from "sonner";
 import { Switch } from "@/components/ui/switch";
 import { TagChip } from "@/components/TagChip";
+import { AGE_RATING_ORDER } from "@/lib/ageRatings";
+import type { TagDef } from "@/contexts/config";
+import { ManagerSync } from "@/components/ManagerSync";
 import { cn } from "@/lib/utils";
-
-interface ConfigurationManagerProps {
-  children?: React.ReactNode;
-}
+import { keyStatuses } from "@/lib/configStatus";
+import { Callout } from "@/components/settings/Callout";
+import { ConfigStatusPanel, CONFIG_STATUS_SUMMARY_ID } from "@/components/settings/ConfigStatusPanel";
+import { SettingRow } from "@/components/settings/SettingRow";
 
 interface SavedConfig {
   userUUID: string;
   installUrl: string;
 }
 
-const LazyInstallDialog = lazy(() =>
-  import("@/components/InstallDialog").then((module) => ({ default: module.InstallDialog }))
-);
 const LazyConfigImportExport = lazy(() =>
   import("@/components/ConfigImportExport").then((module) => ({ default: module.ConfigImportExport }))
 );
+
+
+/** Past this many, names stop being scannable and a count reads better. */
+const MAX_NAMED_TAGS = 4;
+
+function joinTagNames(names: string[]) {
+  return names.map((name, i) => (
+    <span key={name}>
+      {i > 0 && (i === names.length - 1 ? ' or ' : ', ')}
+      <span className="font-medium">{name}</span>
+    </span>
+  ));
+}
 
 function ConfigurationSectionFallback() {
   return (
@@ -39,20 +53,11 @@ function ConfigurationSectionFallback() {
   );
 }
 
-export function ConfigurationManager({ children }: ConfigurationManagerProps) {
-  const { config, setConfig, auth, setAuth, hasBuiltInTvdb, hasBuiltInTmdb, isLoading: contextLoading, snapshotManifestFingerprint } = useConfig();
-  const [password, setPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [savedConfig, setSavedConfig] = useState<SavedConfig | null>(null);
-  const [showPasswordDialog, setShowPasswordDialog] = useState(false);
-  const [isInstallOpen, setIsInstallOpen] = useState(false);
-  const [installUrl, setInstallUrl] = useState("");
-  const [selectedTag, setSelectedTag] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const [addonPassword, setAddonPassword] = useState("");
+export function ConfigurationManager() {
+  const { config, setConfig, auth, setAuth, hasBuiltInTvdb, hasBuiltInTmdb, hasBuiltInGemini, isLoading: contextLoading, manifestChangedSinceInstall, markManifestInstalled } = useConfig();
+  const { requestSave, isSaving, error, savedConfig, canSave, missingKeys, openInstall } = useSave();
+  const [selectedTagNames, setSelectedTagNames] = useState<string[]>([]);
+
   const [requireAddonPassword, setRequireAddonPassword] = useState(false);
   const [showLoadDialog, setShowLoadDialog] = useState(false);
   const [loadPassword, setLoadPassword] = useState("");
@@ -60,7 +65,20 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
   const [loadError, setLoadError] = useState("");
   const [isLoadingLoad, setIsLoadingLoad] = useState(false);
   const [isUUIDTrusted, setIsUUIDTrusted] = useState<boolean | null>(null);
-  const [showReinstallWarning, setShowReinstallWarning] = useState(false);
+
+  const caps = { hasBuiltInTmdb, hasBuiltInTvdb, hasBuiltInGemini };
+  const statuses = useMemo(
+    () => keyStatuses(config, caps),
+    [config, hasBuiltInTmdb, hasBuiltInTvdb, hasBuiltInGemini] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  const identity: SavedConfig | null = useMemo(
+    () => savedConfig
+      ?? (auth.authenticated && auth.userUUID && auth.installUrl
+        ? { userUUID: auth.userUUID, installUrl: auth.installUrl }
+        : null),
+    [savedConfig, auth.authenticated, auth.userUUID, auth.installUrl],
+  );
 
   useEffect(() => {
     fetch("/api/config/addon-info")
@@ -69,17 +87,10 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
       .catch(() => setRequireAddonPassword(false));
   }, []);
 
-  // Auto-load config if userUUID is in URL but not authenticated
   useEffect(() => {
-    if (auth.userUUID && !auth.authenticated) {
-      // Show password dialog to load config
-      setShowPasswordDialog(true);
-    }
-  }, [auth.userUUID, auth.authenticated]);
-
-  useEffect(() => {
-    if (savedConfig?.userUUID && savedConfig.userUUID.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
-      fetch(`/api/config/is-trusted/${encodeURIComponent(savedConfig.userUUID)}`)
+    const uuid = savedConfig?.userUUID ?? (auth.authenticated ? auth.userUUID : null);
+    if (uuid && /^[A-Za-z0-9_-]{3,}$/.test(uuid)) {
+      fetch(`/api/config/is-trusted/${encodeURIComponent(uuid)}`)
         .then(res => res.json())
         .then(data => {
           setIsUUIDTrusted(!!data.trusted);
@@ -93,138 +104,7 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
       setIsUUIDTrusted(null);
       setRequireAddonPassword(false);
     }
-  }, [savedConfig?.userUUID]);
-
-  const validateRequiredKeys = () => {
-    // Don't validate until context is loaded
-    if (contextLoading) {
-      return { valid: true };
-    }
-    
-    
-    const requiredKeys = ['tmdb'];
-    
-    // Check if fanart is selected in any art provider (handles both legacy and new formats)
-    const isFanartSelected = (() => {
-      const artProviders = config.artProviders;
-      if (!artProviders) return false;
-      
-      return ['movie', 'series', 'anime'].some(contentType => {
-        const provider = artProviders[contentType];
-        
-        // Handle legacy string format
-        if (typeof provider === 'string') {
-          return provider === 'fanart';
-        }
-        
-        // Handle new nested object format
-        if (typeof provider === 'object' && provider !== null) {
-          return provider.poster === 'fanart' || 
-                 provider.background === 'fanart' || 
-                 provider.logo === 'fanart';
-        }
-        
-        return false;
-      });
-    })();
-    
-    if (isFanartSelected && !requiredKeys.includes('fanart')) {
-      requiredKeys.push('fanart');
-    }
-    if (config.search?.ai_enabled === true) {
-      const hasGemini = config.apiKeys?.gemini?.trim();
-      const hasOpenRouter = config.apiKeys?.openrouter?.trim();
-      if (!hasGemini && !hasOpenRouter) {
-        requiredKeys.push('gemini_or_openrouter');
-      }
-    }
-    const missingKeys = requiredKeys.filter(key => {
-      if (key === 'tmdb') {
-        const hasUserKey = config.apiKeys.tmdb?.trim();
-        return !hasUserKey && !hasBuiltInTmdb;
-      }
-      if (key === 'gemini_or_openrouter') return true;
-      return !config.apiKeys?.[key] || config.apiKeys[key].trim() === '';
-    });
-    if (missingKeys.length > 0) {
-      return {
-        valid: false,
-        missingKeys,
-        message: `Missing required API keys: ${missingKeys.map(k => k === 'gemini_or_openrouter' ? 'Gemini or OpenRouter' : k).join(', ')}`
-      };
-    }
-    return { valid: true };
-  };
-
-  const handleSaveConfiguration = async () => {
-    setIsLoading(true);
-    setError("");
-    const validation = validateRequiredKeys();
-    if (!validation.valid) {
-      setError(validation.message);
-      setIsLoading(false);
-      return;
-    }
-    const isAuthenticated = auth.authenticated && auth.userUUID && auth.password;
-    try {
-      // Remove instance-specific fields that shouldn't be saved to user config
-      const configToSave = {
-        ...config,
-        apiKeys: {
-          ...config.apiKeys,
-          customDescriptionBlurb: undefined // Never save this - it's instance-specific
-        }
-      };
-      
-      const response = isAuthenticated
-        ? await fetch(`/api/config/update/${encodeURIComponent(auth.userUUID!)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ config: configToSave, password: auth.password, addonPassword })
-          })
-        : await fetch('/api/config/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ config: configToSave, password, addonPassword })
-          });
-      if (!response.ok) {
-        let message = 'Failed to save configuration';
-        try {
-          const errorData = await response.json();
-          message = errorData?.error || message;
-        } catch (_) {
-          const text = await response.text();
-          if (text) message = text;
-        }
-        throw new Error(message);
-      }
-      let result: any;
-      try {
-        result = await response.json();
-      } catch (_) {
-        const text = await response.text();
-        throw new Error(text || 'Invalid JSON response from server');
-      }
-      setSavedConfig(result);
-      setSelectedTag('');
-      if (!isAuthenticated && result?.userUUID) {
-        setAuth({ authenticated: true, userUUID: result.userUUID, password });
-      }
-      setShowPasswordDialog(false);
-      setPassword("");
-      setConfirmPassword("");
-      setAddonPassword("");
-      if (snapshotManifestFingerprint()) {
-        setShowReinstallWarning(true);
-      }
-      toast.success("Configuration saved successfully!");
-    } catch (err) {
-      console.error('Save configuration error:', err);
-      setError(err instanceof Error ? err.message : 'Failed to save configuration');
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  }, [savedConfig?.userUUID, auth.authenticated, auth.userUUID]);
 
   const copyToClipboard = async (text: string, label: string) => {
     try {
@@ -237,20 +117,37 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
   };
 
   const handleLoadConfiguration = async () => {
-    if (!savedConfig?.userUUID) return;
+    if (!identity?.userUUID) return;
     setIsLoadingLoad(true);
     setLoadError("");
     try {
-      const response = await fetch(`/api/config/load/${savedConfig.userUUID}`, {
+      const response = await fetch(`/api/config/load/${encodeURIComponent(identity.userUUID)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: loadPassword, addonPassword: loadAddonPassword })
       });
       if (!response.ok) {
-        const errorData = await response.json();
+        const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.error || 'Failed to load configuration');
       }
       const result = await response.json();
+      if (!result?.success || !result?.config) {
+        throw new Error('Invalid response from server');
+      }
+      setConfig(prev => ({
+        ...result.config,
+        catalogSetupComplete: true,
+        apiKeys: {
+          ...result.config.apiKeys,
+          customDescriptionBlurb: prev.apiKeys.customDescriptionBlurb,
+        },
+      }));
+      setAuth({
+        authenticated: true,
+        userUUID: result.userUUID || identity.userUUID,
+        password: loadPassword,
+        installUrl: result.installUrl ?? null,
+      });
       toast.success("Configuration loaded successfully!");
       setShowLoadDialog(false);
       setLoadPassword("");
@@ -263,62 +160,209 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
     }
   };
 
-  const handleLoadFromUrl = async () => {
-    if (!auth.userUUID) return;
-    setIsLoading(true);
-    setError("");
+  // Linking needs the password once, so it is only offered while the
+  // configuration is open with one in hand.
+  const [ssoState, setSsoState] = useState<{ signedIn: boolean; saved: boolean; label: string }>({
+    signedIn: false,
+    saved: false,
+    label: "",
+  });
+  const [linking, setLinking] = useState(false);
+  const [labelInput, setLabelInput] = useState("");
+  const [renaming, setRenaming] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await fetch('/api/auth/status').then(r => (r.ok ? r.json() : null));
+        if (cancelled || !status?.signedIn) return;
+        const saved = await fetch('/api/profiles').then(r => (r.ok ? r.json() : null));
+        const uuid = identity?.userUUID;
+        if (cancelled) return;
+        const mine = uuid ? (saved?.profiles || []).find((p: any) => p.userUUID === uuid) : null;
+        setSsoState({ signedIn: true, saved: Boolean(mine), label: mine?.label || "" });
+        setLabelInput(mine?.label || "");
+      } catch {
+        if (!cancelled) setSsoState({ signedIn: false, saved: false, label: "" });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [identity?.userUUID]);
+
+  const handleSaveToAccount = async () => {
+    if (!identity?.userUUID || !auth.password) return;
+    const label = labelInput.trim() || config.addonName?.trim() || identity.userUUID.slice(0, 8);
+    setLinking(true);
     try {
-      const response = await fetch(`/api/config/load/${auth.userUUID}`, {
+      const response = await fetch('/api/profiles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password })
+        body: JSON.stringify({
+          userUUID: identity.userUUID,
+          password: auth.password,
+          label,
+        }),
       });
-      const success = response.ok;
-      if (success) {
-        setAuth({ authenticated: true, userUUID: auth.userUUID, password });
-        setShowPasswordDialog(false);
-        setPassword("");
-        setAddonPassword("");
-        toast.success("Configuration loaded successfully!");
-      } else {
-        setError("Invalid password or configuration not found");
-      }
-    } catch (err) {
-      console.error('Load from URL error:', err);
-      setError(err instanceof Error ? err.message : 'Failed to load configuration');
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.error || 'Could not save this configuration');
+      setSsoState(prev => ({ ...prev, saved: true, label: result?.label || label }));
+      setLabelInput(result?.label || label);
+      toast.success('Saved to your account', {
+        description: 'Sign in and pick it from the list instead of typing its UUID and password.',
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not save this configuration');
     } finally {
-      setIsLoading(false);
+      setLinking(false);
     }
   };
 
-  const canSubmitPasswordDialog = auth.userUUID
-    ? password.length >= 6
-    : password.length >= 6 && password === confirmPassword;
-
-  const submitPasswordDialog = () => {
-    if (isLoading || !canSubmitPasswordDialog) return;
-    if (auth.userUUID) {
-      void handleLoadFromUrl();
-      return;
+  const handleRenameProfile = async () => {
+    const label = labelInput.trim();
+    if (!identity?.userUUID || !label || label === ssoState.label) return;
+    setRenaming(true);
+    try {
+      const response = await fetch(`/api/profiles/${encodeURIComponent(identity.userUUID)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label }),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.error || 'Could not rename this configuration');
+      setSsoState(prev => ({ ...prev, label: result?.label || label }));
+      setLabelInput(result?.label || label);
+      toast.success('Name updated');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not rename this configuration');
+    } finally {
+      setRenaming(false);
     }
-    void handleSaveConfiguration();
   };
 
-  const handlePasswordDialogKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key !== "Enter") return;
-    e.preventDefault();
-    submitPasswordDialog();
+  const saveHint = auth.authenticated
+    ? "Updates your saved configuration in the database."
+    : "You'll create a password, then get a UUID and install URL.";
+
+  const profileTags = useMemo(() => config.tags ?? [], [config.tags]);
+
+  // Registry order rather than click order, so the URL and the addon name read the
+  // same way the chips do. Renamed or deleted tags drop out on their own.
+  const selectedTags = useMemo(
+    () => profileTags.map(t => t.name).filter(name => selectedTagNames.includes(name)),
+    [profileTags, selectedTagNames],
+  );
+
+  const enabledTagCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const catalog of config.catalogs ?? []) {
+      if (!catalog.enabled) continue;
+      for (const tag of catalog.tags ?? []) {
+        const key = tag.toLowerCase();
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [config.catalogs]);
+
+  const emptyTags = selectedTags.filter(name => !enabledTagCounts[name.toLowerCase()]);
+
+  // A limit rides along with the profile that carries it, so the URL never has to name
+  // one. Each catalog answers to the profiles it is in, so a mixed install caps only
+  // part of itself. Rows in no profile, search among them, take the strictest of all.
+  const profileLimit = useMemo(() => {
+    const selected = selectedTags
+      .map(name => profileTags.find(t => t.name === name))
+      .filter((t): t is TagDef => !!t);
+    const capped = selected.filter(t => !!t.ageRating && t.ageRating !== 'None');
+    if (capped.length === 0) return null;
+    const strictest = capped.reduce((a, b) =>
+      AGE_RATING_ORDER.indexOf(a.ageRating as never) <= AGE_RATING_ORDER.indexOf(b.ageRating as never) ? a : b
+    ).ageRating!;
+    const hiding = capped.filter(t => t.allowUnratedContent === false).length;
+    return {
+      strictest,
+      uniform: capped.length === selected.length && capped.every(t => t.ageRating === strictest),
+      hidesUnrated: hiding > 0,
+      allHideUnrated: hiding === capped.length,
+    };
+  }, [selectedTags, profileTags]);
+
+  // One tag per param. A tag name can hold any character, so a separator would be
+  // ambiguous for the addon to split back apart.
+  const taggedInstallUrl = useMemo(() => {
+    if (!identity) return "";
+    const params = selectedTags.map(name => `tag=${encodeURIComponent(name)}`);
+    if (params.length === 0) return identity.installUrl;
+    return `${identity.installUrl}?${params.join('&')}`;
+  }, [identity, selectedTags]);
+
+  const toggleTag = (name: string) => {
+    setSelectedTagNames(prev =>
+      prev.includes(name) ? prev.filter(t => t !== name) : [...prev, name]
+    );
   };
-
-  const validation = useMemo(() => validateRequiredKeys(), [config, hasBuiltInTmdb, hasBuiltInTvdb, contextLoading]);
-
-  const profileTags = config.tags ?? [];
-  const taggedInstallUrl = savedConfig
-    ? (selectedTag ? `${savedConfig.installUrl}?tag=${encodeURIComponent(selectedTag)}` : savedConfig.installUrl)
-    : "";
 
   return (
     <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <List className="h-5 w-5" />
+            Addon Resources
+          </CardTitle>
+          <CardDescription>What your addon exposes to your client.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <SettingRow
+              htmlFor="catalog-mode-only"
+              label="Catalog Mode Only"
+              description="Catalogs only, no Meta. Use when another addon supplies it: a second AIOMetadata instance, or a different meta provider."
+              control={
+                <Switch
+                  id="catalog-mode-only"
+                  checked={config.catalogModeOnly ?? false}
+                  onCheckedChange={(checked) => {
+                    setConfig(prev => ({
+                      ...prev,
+                      catalogModeOnly: checked
+                    }));
+                  }}
+                />
+              }
+              note={config.catalogModeOnly ? (
+                <Callout variant="warn">
+                  Meta will come from another addon. AIOMetadata's meta and art provider settings won't apply.
+                </Callout>
+              ) : null}
+            />
+
+            <SettingRow
+              htmlFor="hide-stremio-catalogs"
+              label="Hide Stremio-Specific Catalogs"
+              description="Leaves catalogs only Stremio uses, such as Calendar videos, out of the manifest. Clients that don't use them can flicker while they render them and then drop them."
+              control={
+                <Switch
+                  id="hide-stremio-catalogs"
+                  checked={config.hideStremioCatalogs ?? false}
+                  onCheckedChange={(checked) => {
+                    setConfig(prev => ({
+                      ...prev,
+                      hideStremioCatalogs: checked
+                    }));
+                  }}
+                />
+              }
+              note={config.hideStremioCatalogs ? (
+                <Callout variant="warn">
+                  Clients that do use the Calendar will lose it.
+                </Callout>
+              ) : null}
+            />
+          </div>
+        </CardContent>
+      </Card>
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -330,308 +374,35 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label>API Keys Status</Label>
-            <div className="space-y-2">
-              {[
-                { key: 'tmdb', name: 'TMDB' },
-                { key: 'tvdb', name: 'TVDB' },
-                { key: 'mdblist', name: 'MDBList' },
-                { key: 'fanart', name: 'Fanart' },
-                { key: 'ai_service', name: 'AI Service' }
-              ].map(({ key, name }) => {
-                const hasUserKey = key === 'ai_service'
-                  ? !!(config.apiKeys?.gemini?.trim() || config.apiKeys?.openrouter?.trim())
-                  : !!config.apiKeys?.[key]?.trim();
-                const hasBuiltInKey = key === 'tmdb' ? hasBuiltInTmdb : (key === 'tvdb' ? hasBuiltInTvdb : false);
-                const isConfigured = !!(hasUserKey || hasBuiltInKey);
-                
-                // Check if this key is actually being used
-                const isInUse = (() => {
-                  if (key === 'tmdb') return true; // Always required
-                  if (key === 'tvdb') {
-                    // Check if TVDB is used in providers or art providers
-                    const isTvdbInProviders = 
-                      config.providers?.movie === 'tvdb' ||
-                      config.providers?.series === 'tvdb' ||
-                      config.providers?.anime === 'tvdb';
-                    
-                    const isTvdbInArt = ['movie', 'series', 'anime'].some(contentType => {
-                      const provider = config.artProviders?.[contentType];
-                      if (typeof provider === 'string') {
-                        return provider === 'tvdb';
-                      }
-                      if (typeof provider === 'object' && provider !== null) {
-                        return provider.poster === 'tvdb' || 
-                               provider.background === 'tvdb' || 
-                               provider.logo === 'tvdb';
-                      }
-                      return false;
-                    });
-                    
-                    return isTvdbInProviders || isTvdbInArt;
-                  }
-                  if (key === 'mdblist') {
-                    // Check if MDBList is used in catalogs
-                    return config.catalogs?.some(c => c.id.startsWith('mdblist.'));
-                  }
-                  if (key === 'fanart') {
-                    // Check if fanart is used in art providers
-                    const artProviders = config.artProviders;
-                    if (!artProviders) return false;
-                    
-                    return ['movie', 'series', 'anime'].some(contentType => {
-                      const provider = artProviders[contentType];
-                      if (typeof provider === 'string') {
-                        return provider === 'fanart';
-                      }
-                      if (typeof provider === 'object' && provider !== null) {
-                        return provider.poster === 'fanart' || 
-                               provider.background === 'fanart' || 
-                               provider.logo === 'fanart';
-                      }
-                      return false;
-                    });
-                  }
-                  if (key === 'ai_service') {
-                    return !!(config.search?.ai_enabled === true);
-                  }
-                  return false;
-                })();
-                
-                const isRequired = key === 'tmdb' || isInUse;
-                
-                return (
-                  <div key={key} className="flex items-center justify-between py-2 border-b border-gray-200 last:border-b-0">
-                    <div className="flex items-center gap-3">
-                      {isConfigured ? (
-                        <CheckCircle className="h-4 w-4 text-green-500" />
-                      ) : (
-                        <AlertCircle className="h-4 w-4 text-red-500" />
-                      )}
-                      <div>
-                        <span className="text-sm font-medium">{name}</span>
-                        <span className="text-xs text-gray-500 ml-2">
-                          {isRequired ? 'Required' : 'Optional'}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="text-sm">
-                      {isConfigured ? (
-                        <span className="text-green-600 font-medium">Configured</span>
-                      ) : (
-                        <span className="text-red-600 font-medium">Missing</span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+          <ConfigStatusPanel
+            statuses={statuses}
+            missingKeys={missingKeys}
+            loading={contextLoading}
+          />
 
           <div className="space-y-3">
-            {!validation.valid && (
-              <p className="text-sm text-red-600">
-                Please configure all required API keys before saving
-              </p>
-            )}
-            {error && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                <div className="flex items-center gap-2">
-                  <AlertCircle className="h-4 w-4 text-red-500" />
-                  <span className="text-sm text-red-700">{error}</span>
-                </div>
-              </div>
-            )}
-            
-            {/* Catalog Mode Only Toggle */}
-            <div className="flex items-center justify-between p-4 border rounded-lg bg-muted/50">
-              <div className="flex items-center gap-3">
-                <List className="h-5 w-5 text-muted-foreground" />
-                <div>
-                  <Label htmlFor="catalog-mode-only" className="text-sm font-medium cursor-pointer">
-                    Catalog Mode Only
-                  </Label>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    Remove metadata resource from manifest (catalogs only, no item details). Useful when adding multiple instances of AIOMetadata to an app.
-                  </p>
-                </div>
-              </div>
-              <Switch
-                id="catalog-mode-only"
-                checked={config.catalogModeOnly ?? false}
-                onCheckedChange={(checked) => {
-                  setConfig(prev => ({
-                    ...prev,
-                    catalogModeOnly: checked
-                  }));
-                }}
-              />
-            </div>
-            
-            <div className="flex justify-end">
-              <Dialog open={!auth.authenticated && showPasswordDialog} onOpenChange={setShowPasswordDialog}>
-              <Button
-                disabled={!validation.valid || isLoading}
-                className="flex items-center gap-2"
-                onClick={() => {
-                  if (!validation.valid || isLoading) return;
-                  
-                  setError("");
-                  
-                  // Check if TVDB is being used anywhere
-                  const isTvdbInProviders = 
-                    config.providers?.movie === 'tvdb' ||
-                    config.providers?.series === 'tvdb' ||
-                    config.providers?.anime === 'tvdb';
-                  
-                  const isTvdbInArt = ['movie', 'series', 'anime'].some(contentType => {
-                    const provider = config.artProviders?.[contentType];
-                    if (typeof provider === 'string') {
-                      return provider === 'tvdb';
-                    }
-                    if (typeof provider === 'object' && provider !== null) {
-                      return provider.poster === 'tvdb' || 
-                             provider.background === 'tvdb' || 
-                             provider.logo === 'tvdb';
-                    }
-                    return false;
-                  });
-                  
-                  // Only validate TVDB key if TVDB is actually being used
-                  if (isTvdbInProviders || isTvdbInArt) {
-                    const hasTvdbKey = !!config.apiKeys?.tvdb?.trim() || hasBuiltInTvdb;
-                    if (!hasTvdbKey) {
-                      setError("TVDB is selected as a provider but no TVDB API key is configured. Please add your TVDB API key in the Integrations tab or choose a different provider.");
-                      return;
-                    }
-                  }
-                  
-                  if (auth.authenticated) {
-                    void handleSaveConfiguration();
-                  } else {
-                    setShowPasswordDialog(true);
-                  }
-                }}
-              >
-                {isLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Save className="h-4 w-4" />
-                )}
-                Save Configuration
-              </Button>
-              <DialogContent>
-                <DialogHeader>
-                   <DialogTitle>{auth.userUUID ? 'Load Configuration' : 'Create Password'}</DialogTitle>
-                  <DialogDescription>
-                    {auth.userUUID 
-                      ? 'Enter your password to load your existing configuration.'
-                      : 'Create a password to protect your configuration. You\'ll need this password to access your configuration later.'
-                    }
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="space-y-4">
-                  {error && (
-                    <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                      <div className="flex items-center gap-2">
-                        <AlertCircle className="h-4 w-4 text-red-500" />
-                        <span className="text-sm text-red-700">{error}</span>
-                      </div>
-                    </div>
-                  )}
-                   <div className="space-y-2">
-                    <Label htmlFor="password">Password</Label>
-                    <div className="relative">
-                      <Input
-                        id="password"
-                        type={showPassword ? "text" : "password"}
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        onKeyDown={handlePasswordDialogKeyDown}
-                        placeholder="Enter your password"
-                        minLength={6}
-                      />
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="absolute right-2 top-1/2 -translate-y-1/2"
-                        onClick={() => setShowPassword(!showPassword)}
-                      >
-                        {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                      </Button>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">Password must be at least 6 characters long.</p>
-                  </div>
-                   {!auth.userUUID && (
-                     <div className="space-y-2">
-                       <Label htmlFor="confirmPassword">Confirm Password</Label>
-                       <div className="relative">
-                         <Input
-                           id="confirmPassword"
-                           type={showConfirmPassword ? "text" : "password"}
-                           value={confirmPassword}
-                           onChange={(e) => setConfirmPassword(e.target.value)}
-                           onKeyDown={handlePasswordDialogKeyDown}
-                           placeholder="Confirm your password"
-                           minLength={6}
-                         />
-                         <Button
-                           variant="ghost"
-                           size="sm"
-                           className="absolute right-2 top-1/2 -translate-y-1/2"
-                           onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-                         >
-                           {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                         </Button>
-                       </div>
-                       <p className="text-xs text-muted-foreground mt-1">Must match the password above and be at least 6 characters.</p>
-                     </div>
-                   )}
-                  {requireAddonPassword && (
-                    <div className="space-y-2">
-                      <Label htmlFor="addonPassword">Addon Password</Label>
-                      <Input
-                        id="addonPassword"
-                        type="password"
-                        value={addonPassword}
-                        onChange={e => setAddonPassword(e.target.value)}
-                        onKeyDown={handlePasswordDialogKeyDown}
-                        placeholder="Enter the addon password"
-                        minLength={6}
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">Required by the addon administrator.</p>
-                    </div>
-                  )}
-                  <div className="flex justify-end gap-2">
-                    <Button 
-                      variant="outline" 
-                      onClick={() => setShowPasswordDialog(false)}
-                    >
-                      Cancel
-                    </Button>
-                    <Button 
-                      onClick={submitPasswordDialog}
-                      disabled={isLoading || !canSubmitPasswordDialog}
-                    >
-                      {isLoading ? (
-                        <>
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          {auth.userUUID ? 'Loading...' : 'Saving...'}
-                        </>
-                      ) : (
-                        auth.userUUID ? 'Load Configuration' : 'Save Configuration'
-                      )}
-                    </Button>
-                  </div>
-                </div>
-              </DialogContent>
-            </Dialog>
-            </div>
+            {error && <Callout variant="danger">{error}</Callout>}
           </div>
         </CardContent>
+        <CardFooter className="border-t pt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-muted-foreground">{saveHint}</p>
+          <Button
+            size="lg"
+            disabled={!canSave || isSaving}
+            aria-describedby={CONFIG_STATUS_SUMMARY_ID}
+            className="w-full sm:w-auto flex items-center gap-2"
+            onClick={requestSave}
+          >
+            {isSaving ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Save className="h-4 w-4" />
+            )}
+            Save Configuration
+          </Button>
+        </CardFooter>
       </Card>
-      {savedConfig && (
+      {identity && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -643,19 +414,73 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            {ssoState.signedIn && (
+              ssoState.saved ? (
+                <div className="space-y-2 rounded-md border p-3">
+                  <p className="text-[11px] text-emerald-500">
+                    Saved to your account. Signing in is enough to open it from now on.
+                  </p>
+                  <div>
+                    <Label htmlFor="profile-label" className="text-sm font-medium">Name in your account</Label>
+                    <div className="flex items-center gap-2 mt-1">
+                      <Input
+                        id="profile-label"
+                        value={labelInput}
+                        maxLength={64}
+                        placeholder={identity.userUUID.slice(0, 8)}
+                        onChange={e => setLabelInput(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleRenameProfile(); } }}
+                        className="text-sm"
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={renaming || !labelInput.trim() || labelInput.trim() === ssoState.label}
+                        onClick={handleRenameProfile}
+                      >
+                        {renaming ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Rename'}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      How this configuration is listed when you sign in.
+                    </p>
+                  </div>
+                </div>
+              ) : auth.password ? (
+                <div className="space-y-2 rounded-md border p-3">
+                  <p className="text-[11px] text-muted-foreground">
+                    Save this to your account and you will not need its UUID or password again.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      value={labelInput}
+                      maxLength={64}
+                      placeholder={config.addonName?.trim() || identity.userUUID.slice(0, 8)}
+                      onChange={e => setLabelInput(e.target.value)}
+                      aria-label="Name in your account"
+                      className="text-sm"
+                    />
+                    <Button size="sm" variant="outline" disabled={linking} onClick={handleSaveToAccount}>
+                      {linking ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : null}
+                      Save to my account
+                    </Button>
+                  </div>
+                </div>
+              ) : null
+            )}
             <div className="space-y-3">
               <div>
                 <Label className="text-sm font-medium">Your UUID</Label>
                 <div className="flex items-center gap-2 mt-1">
                   <Input 
-                    value={savedConfig.userUUID} 
+                    value={identity.userUUID} 
                     readOnly 
                     className="font-mono text-sm"
                   />
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => copyToClipboard(savedConfig.userUUID, 'UUID')}
+                    onClick={() => copyToClipboard(identity.userUUID, 'UUID')}
                   >
                     <Copy className="h-4 w-4" />
                   </Button>
@@ -668,10 +493,11 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                     <span className="text-xs text-muted-foreground mr-1">Profile:</span>
                     <button
                       type="button"
-                      onClick={() => setSelectedTag('')}
+                      onClick={() => setSelectedTagNames([])}
+                      aria-pressed={selectedTags.length === 0}
                       className={cn(
                         'rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors',
-                        selectedTag === ''
+                        selectedTags.length === 0
                           ? 'border-primary bg-primary text-primary-foreground'
                           : 'border-muted-foreground/30 text-muted-foreground hover:text-foreground',
                       )}
@@ -683,8 +509,12 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                         key={t.name}
                         name={t.name}
                         color={t.color}
-                        onClick={() => setSelectedTag(t.name)}
-                        dimmed={selectedTag !== '' && selectedTag !== t.name}
+                        suffix={t.ageRating && t.ageRating !== 'None'
+                          ? <span title={`Content rating ${t.ageRating} and lower`}>{t.ageRating}</span>
+                          : undefined}
+                        onClick={() => toggleTag(t.name)}
+                        pressed={selectedTags.includes(t.name)}
+                        dimmed={selectedTags.length > 0 && !selectedTags.includes(t.name)}
                       />
                     ))}
                   </div>
@@ -698,47 +528,57 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => copyToClipboard(taggedInstallUrl, 'Install URL')}
+                    onClick={() => { markManifestInstalled(); copyToClipboard(taggedInstallUrl, 'Install URL'); }}
                   >
                     <Copy className="h-4 w-4" />
                   </Button>
                 </div>
-                {selectedTag !== '' && (
+                {selectedTags.length > 0 && (
                   <p className="text-xs text-muted-foreground mt-1">
-                    Installs only catalogs tagged <span className="font-medium">{selectedTag}</span> as a separate addon profile.
+                    {selectedTags.length > MAX_NAMED_TAGS ? (
+                      <>Installs only catalogs carrying any of the <span className="font-medium">{selectedTags.length} selected tags</span>, as a separate addon profile.</>
+                    ) : (
+                      <>Installs only catalogs tagged {joinTagNames(selectedTags)} as a separate addon profile.</>
+                    )}
+                  </p>
+                )}
+                {emptyTags.length > 0 && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    {emptyTags.length > MAX_NAMED_TAGS ? (
+                      <><span className="font-medium">{emptyTags.length} of the selected tags</span> have no enabled catalog, so nothing will install from them.</>
+                    ) : (
+                      <>No enabled catalog is tagged {joinTagNames(emptyTags)}, so nothing will install from it.</>
+                    )}
+                  </p>
+                )}
+                {profileLimit && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {profileLimit.uniform ? (
+                      <>Shows only titles rated <span className="font-medium">{profileLimit.strictest}</span> or lower, the content rating this profile installs with.</>
+                    ) : (
+                      <>Each profile shows only titles within the content rating on its chip. Search belongs to no profile, so it uses the strictest of them, <span className="font-medium">{profileLimit.strictest}</span>.</>
+                    )}
+                  </p>
+                )}
+                {profileLimit?.hidesUnrated && (
+                  <p className="text-xs text-amber-400 mt-1">
+                    {profileLimit.allHideUnrated
+                      ? 'It also hides titles with no rating, search included.'
+                      : 'Profiles that hide titles with no rating hide them from search too.'}{' '}
+                    Search results rarely carry a rating, so expect search to return very little.
                   </p>
                 )}
               </div>
             </div>
-            <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
-              <div className="flex items-start gap-2">
-                <AlertCircle className="h-4 w-4 text-blue-500 mt-0.5" />
-                <span className="text-sm text-blue-700">
-                  <strong>Important:</strong> Save your UUID and password. You'll need both to access your configuration later.
-                </span>
-              </div>
-            </div>
-            {showReinstallWarning && (
-              <div className="p-3 bg-yellow-50 border border-yellow-300 rounded-md">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="h-4 w-4 text-yellow-600 mt-0.5 shrink-0" />
-                    <span className="text-sm text-yellow-800">
-                      <strong>Reinstall Required:</strong> Your configuration was saved, but the changes you made affect the addon manifest (catalogs, search, or resources). Stremio does not auto-reload manifests, so you need to reinstall the addon for these changes to take effect.
-                    </span>
-                  </div>
-                  <Button variant="ghost" size="sm" className="shrink-0 text-yellow-700 hover:text-yellow-900 hover:bg-yellow-100 -mt-1 -mr-1" onClick={() => setShowReinstallWarning(false)}>
-                    Dismiss
-                  </Button>
-                </div>
-              </div>
-            )}
+            <Callout variant="info">
+              <strong>Important:</strong> Save your UUID and password. You'll need both to access your configuration later.
+            </Callout>
             <div className="flex gap-2">
               <Dialog open={showLoadDialog} onOpenChange={setShowLoadDialog}>
                 <Button
                   variant="outline"
                   onClick={() => setShowLoadDialog(true)}
-                  disabled={isLoading}
+                  disabled={isLoadingLoad}
                 >
                   Load Configuration
                 </Button>
@@ -750,18 +590,11 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                     </DialogDescription>
                   </DialogHeader>
                   <div className="space-y-4">
-                    {loadError && (
-                      <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                        <div className="flex items-center gap-2">
-                          <AlertCircle className="h-4 w-4 text-red-500" />
-                          <span className="text-sm text-red-700">{loadError}</span>
-                        </div>
-                      </div>
-                    )}
+                    {loadError && <Callout variant="danger">{loadError}</Callout>}
                     <div className="space-y-2">
-                      <Label htmlFor="loadPassword">Password</Label>
+                      <Label htmlFor="cfgmgr-load-password">Password</Label>
                       <Input
-                        id="loadPassword"
+                        id="cfgmgr-load-password"
                         type="password"
                         value={loadPassword}
                         onChange={e => setLoadPassword(e.target.value)}
@@ -772,9 +605,9 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                     </div>
                     {requireAddonPassword && isUUIDTrusted === false && (
                       <div className="space-y-2">
-                        <Label htmlFor="loadAddonPassword">Addon Password</Label>
+                        <Label htmlFor="cfgmgr-load-addon-password">Addon Password</Label>
                         <Input
-                          id="loadAddonPassword"
+                          id="cfgmgr-load-addon-password"
                           type="password"
                           value={loadAddonPassword}
                           onChange={e => setLoadAddonPassword(e.target.value)}
@@ -813,9 +646,14 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
                   </div>
                 </DialogContent>
               </Dialog>
-              <Button onClick={() => { setInstallUrl(taggedInstallUrl); setIsInstallOpen(true); }}>
+              <Button onClick={() => openInstall(taggedInstallUrl)}>
                 <Download className="h-4 w-4 mr-2" /> Install
               </Button>
+              <ManagerSync
+                baseInstallUrl={identity.installUrl}
+                currentProfileTags={selectedTags}
+                onSynced={() => { markManifestInstalled(); }}
+              />
             </div>
           </CardContent>
         </Card>
@@ -825,13 +663,7 @@ export function ConfigurationManager({ children }: ConfigurationManagerProps) {
       <Suspense fallback={<ConfigurationSectionFallback />}>
         <LazyConfigImportExport />
       </Suspense>
-      
-      {children}
-      {isInstallOpen ? (
-        <Suspense fallback={null}>
-          <LazyInstallDialog isOpen={isInstallOpen} onClose={() => setIsInstallOpen(false)} manifestUrl={installUrl} />
-        </Suspense>
-      ) : null}
+
     </div>
   );
 }

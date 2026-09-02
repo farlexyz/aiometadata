@@ -3,17 +3,25 @@ const favicon = require('serve-favicon');
 const fs = require('fs');
 const path = require("path");
 const crypto = require('crypto');
+const stream = require('stream');
 const v8 = require('v8');
 const addon = express();
 // Honor X-Forwarded-* headers from reverse proxies (e.g., Traefik) so req.protocol reflects HTTPS
 //addon.set('trust proxy', true);
 
 const { getCatalog } = require("./lib/getCatalog");
+const { applyCatalogFilters, catalogFiltersActive } = require("./utils/catalogFilters");
+const { cursorKey, resolveStartPage, writeCursor, fillFilteredPage } = require("./lib/catalogPagination");
 const anilist = require("./lib/anilist");
 const { getSearch } = require("./lib/getSearch");
-const { getManifest, DEFAULT_LANGUAGE } = require("./lib/getManifest");
+const { getManifest, resolveManifestTags, DEFAULT_LANGUAGE } = require("./lib/getManifest");
+const { resolveInstallFilters, uniformTagRating, allowsUnrated, scopeTagsToCatalog } = require("./utils/ageRating");
 const { getMeta } = require("./lib/getMeta");
-const { cacheWrapMetaSmart, cacheWrapCatalog, cacheWrapSearch, cacheWrapJikanApi, cacheWrapStaticCatalog, cacheWrapGlobal, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
+const { cacheWrapMetaSmart, cacheWrapCatalog, cacheWrapSearch, cacheWrapJikanApi, cacheWrapGlobal, getCacheHealth, clearCacheHealth, logCacheHealth, stableStringify, deleteKeysByPattern, scanKeys } = require("./lib/getCache");
+const { hasPermission } = require("./lib/authSession");
+const { isOidcConfigured } = require("./lib/oidc");
+const { resolveConfigAccess } = require("./lib/configAccess");
+const managerAccounts = require("./lib/managerAccounts");
 const redis = require("./lib/redisClient");
 const { warmEssentialContent, warmPopularContent, scheduleEssentialWarming } = require("./lib/cacheWarmer");
 const requestTracker = require("./lib/requestTracker");
@@ -23,159 +31,127 @@ const consola = require('consola');
 const aiCatalogLogger = consola.withTag('AICatalog');
 const { stripReleaseAvailabilityForResponse } = require('./utils/releaseAvailability');
 
-const { getMediaRatingFromMDBList } = require("./utils/mdbList");
+const { supportsMdblistScoreFilters } = require("./utils/mdbList");
 
-// Warm user-specific content based on their config
-async function warmUserContent(userUUID, contentType) {
-  try {
-    // Load user config
-    const config = await loadConfigFromDatabase(userUUID);
-    if (!config) return;
-    
-    // Add userUUID to config for per-user token caching
-    config.userUUID = userUUID;
-    
-    // Warm popular content based on user's preferences
-    const language = config.language || DEFAULT_LANGUAGE;
-    
-    // Note: Popular content warming is now handled globally by warmPopularContent()
-    // which runs every 6 hours and caches trending content for all users
-    
-    consola.success(`[Cache Warming] User content warmed for ${userUUID} (${contentType})`);
-  } catch (error) {
-    consola.warn(`[Cache Warming] Failed to warm user content for ${userUUID}:`, error.message);
-  }
-}
 const configApi = require('./lib/configApi');
 const database = require('./lib/database');
 const { loadConfigFromDatabase } = require('./lib/configApi');
 const { getTrending } = require("./lib/getTrending");
-const { getRpdbPoster, getRatingPosterUrl, parseAnimeCatalogMeta, parseAnimeCatalogMetaBatch } = require("./utils/parseProps");
+const { resolveProxyRatingPosterUrl, parseAnimeCatalogMetaBatch } = require("./utils/parseProps");
+const { extractIdsFromMeta, extractCanonicalIdFromDynamicUpNextId } = require("./utils/metaIds");
+const { sleep } = require("./utils/concurrency");
+const { resolveMdblistKey, mdblistCacheKey } = require("./utils/mdblistUtils");
+const { normalizeTraktEndpoint, resolveTraktProxyAuthMode } = require("./utils/traktProxyRoutes");
+const { normalizeTvdbListRecord, enrichTvdbListRecords } = require("./utils/tvdbLists");
+const { resolveTmdbDiscoverApiKey, resolveTvdbDiscoverApiKey, normalizeTmdbDiscoverType, normalizeTvdbDiscoverType, toTvdbCountryCode } = require("./utils/discoverParams");
+const { normalizeRedirectUri } = require("./utils/oauthRedirect");
+const { shuffleMetas } = require("./utils/mergedCatalog");
 const { getFavorites, getWatchList } = require("./lib/getPersonalLists");
 const { resolveDynamicTmdbDiscoverParams } = require('./lib/tmdbDiscoverDateTokens');
+const { isDiscoverCatalogId, applyDiscoverSignature } = require('./lib/discoverCatalogSignature');
 const { blurImage, convertBannerToBackground } = require('./utils/imageProcessor');
+const { getAiTriggerKeyword, applyAiTrigger } = require('./utils/aiSearchTrigger');
 const { TraktClient } = require('./lib/trakt');
+const movielens = require('./lib/movielens');
+const {
+  createAniListOAuthState,
+  createMalOAuthTransaction,
+  createSimklOAuthState,
+  createTraktOAuthState,
+  verifyAniListOAuthState,
+  verifyMalOAuthState,
+  verifySimklOAuthState,
+  verifyTraktOAuthState,
+} = require('./lib/oauthState');
+const { renderOAuthPage } = require('./lib/oauthPage');
+const { hasAnyWatchTrackingEnabled } = require('./lib/watchTracking');
 const { SimklClient } = require('./lib/simkl');
-const axios = require('axios');
-const getCountryISO3 = require('country-iso-2-to-3');
+const {
+  createSessionId,
+  deleteDeviceAuthSession,
+  getDeviceAuthSession,
+  registerPoll,
+  saveDeviceAuthSession,
+  widenPollInterval,
+} = require('./lib/deviceAuthSessions');
 const jikan = require('./lib/mal');
 const buildInfo = require('./lib/buildInfo');
 const { clientDistDir, clientIndexPath, publicDir } = require('./lib/runtimePaths');
 const ADDON_VERSION = buildInfo.version;
-const sharp = require('sharp');
+const { withGlobalEpoch } = require('./lib/cacheEpoch');
 const idMapper = require('./lib/id-mapper');
 const wikiMappings = require('./lib/wiki-mapper.js');
 
 // Normalize redirect URIs to always include a scheme
-const normalizeRedirectUri = (uri) => {
-  if (!uri) return uri;
-  const trimmed = uri.trim();
-  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
-  }
-  return `https://${trimmed.replace(/^\/+/, '')}`;
-};
+// Best-effort same-process duplicate handling. Trakt enforces authorization-code
+// single use; this set is not shared across replicas and does not consume state.
 const usedTraktCodes = new Set();
-const pendingTraktOAuthStates = new Map();
 const TRAKT_OAUTH_STATE_TTL_MS = parseInt(process.env.TRAKT_OAUTH_STATE_TTL_MS || String(10 * 60 * 1000), 10);
 const usedAnilistCodes = new Set();
+const ANILIST_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const SIMKL_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
-function extractCanonicalIdFromDynamicUpNextId(type, stremioId) {
-  if (type !== 'series' || typeof stremioId !== 'string') {
-    return null;
+// Which Simkl flows this instance offers. PIN needs only a client id, so it is
+// the default when no secret is set.
+function resolveSimklAuthMode() {
+  const configured = String(getSetting('SIMKL_AUTH_MODE') || '').trim().toLowerCase();
+  if (configured === 'pin' || configured === 'oauth' || configured === 'both') {
+    return configured;
   }
-
-  const prefixes = ['mdblist_upnext_', 'pmdb_resume_', 'upnext_'];
-  const prefix = prefixes.find(p => stremioId.startsWith(p));
-  if (!prefix) {
-    return null;
-  }
-
-  const remainder = stremioId.slice(prefix.length);
-  const episodeSeparatorIndex = remainder.lastIndexOf('_');
-  if (episodeSeparatorIndex <= 0) {
-    return null;
-  }
-
-  const canonicalId = remainder.slice(0, episodeSeparatorIndex);
-  const episodePart = remainder.slice(episodeSeparatorIndex + 1);
-  const isSupportedCanonicalId = /^tt\d+$/.test(canonicalId) ||
-    /^tmdb:\d+$/.test(canonicalId) ||
-    /^tvdb:\d+$/.test(canonicalId);
-  const isSupportedEpisodePart = /^trakt\d+$/.test(episodePart) ||
-    /^S\d+E\d+$/.test(episodePart) ||
-    episodePart === 'unknown';
-
-  return isSupportedCanonicalId && isSupportedEpisodePart ? canonicalId : null;
+  return getSetting('SIMKL_CLIENT_SECRET') ? 'oauth' : 'pin';
 }
 
-function createTraktOAuthState() {
-  const state = crypto.randomBytes(32).toString('hex');
-  const expiresAt = Date.now() + TRAKT_OAUTH_STATE_TTL_MS;
-  pendingTraktOAuthStates.set(state, expiresAt);
+function simklPinEnabled() {
+  const mode = resolveSimklAuthMode();
+  return mode === 'pin' || mode === 'both';
+}
 
-  // Opportunistic cleanup to keep the in-memory map bounded.
-  const now = Date.now();
-  for (const [storedState, storedExpiresAt] of pendingTraktOAuthStates.entries()) {
-    if (storedExpiresAt <= now) {
-      pendingTraktOAuthStates.delete(storedState);
-    }
+const usedMalCodes = new Set();
+const MAL_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+
+
+
+
+const { createResponseCompression } = require('./utils/responseCompression');
+addon.use(createResponseCompression());
+
+// Parse JSON and URL-encoded bodies for API routes.
+// The parser mounts before settings load, so the limit is resolved per request
+// rather than captured here, and a parser is kept per distinct limit.
+const jsonBodyParsers = new Map();
+
+function jsonBodyParserFor(limit) {
+  let parser = jsonBodyParsers.get(limit);
+  if (!parser) {
+    parser = express.json({ limit });
+    jsonBodyParsers.set(limit, parser);
   }
-
-  return state;
+  return parser;
 }
 
-function consumeTraktOAuthState(state) {
-  if (!state || typeof state !== 'string') return false;
-  const expiresAt = pendingTraktOAuthStates.get(state);
-  if (!expiresAt) return false;
-  pendingTraktOAuthStates.delete(state);
-  return expiresAt > Date.now();
-}
-
-function shuffleMetas(metas = []) {
-  const shuffled = Array.isArray(metas) ? metas.slice() : [];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+addon.use((req, res, next) => {
+  let limit;
+  try {
+    limit = getSetting('MAX_REQUEST_BODY_SIZE');
+  } catch {
+    limit = '';
   }
-  return shuffled;
-}
-
-/**
- * Extract IDs from a catalog meta object for custom art URL resolution.
- * Handles id formats: "tmdb:123", "tvdb:456", "tt1234567", "kitsu:123", "mal:123", "anilist:123", "anidb:123"
- */
-function extractIdsFromMeta(meta) {
-  const ids = {};
-  if (!meta) return ids;
-
-  const id = meta.id || '';
-  if (id) ids.id = id;
-  if (id.startsWith('tmdb:')) ids.tmdbId = id.slice(5);
-  else if (id.startsWith('tvdb:')) ids.tvdbId = id.slice(5);
-  else if (id.startsWith('kitsu:')) ids.kitsuId = id.slice(6);
-  else if (id.startsWith('mal:')) ids.malId = id.slice(4);
-  else if (id.startsWith('anilist:')) ids.anilistId = id.slice(8);
-  else if (id.startsWith('anidb:')) ids.anidbId = id.slice(6);
-  else if (id.startsWith('tt')) ids.imdbId = id;
-
-  // Pick up additional IDs from meta properties
-  if (meta.imdb_id) ids.imdbId = meta.imdb_id;
-  if (meta._tmdbId && !ids.tmdbId) ids.tmdbId = meta._tmdbId;
-  if (meta._tvdbId && !ids.tvdbId) ids.tvdbId = meta._tvdbId;
-  if (meta._imdbId && !ids.imdbId) ids.imdbId = meta._imdbId;
-  if (meta._malId && !ids.malId) ids.malId = meta._malId;
-  if (meta._kitsuId && !ids.kitsuId) ids.kitsuId = meta._kitsuId;
-  if (meta._anilistId && !ids.anilistId) ids.anilistId = meta._anilistId;
-  if (meta._anidbId && !ids.anidbId) ids.anidbId = meta._anidbId;
-
-  return ids;
-}
-
-// Parse JSON and URL-encoded bodies for API routes
-addon.use(express.json({ limit: '2mb' }));
+  return jsonBodyParserFor(limit || '8mb')(req, res, next);
+});
 addon.use(express.urlencoded({ extended: true }));
+
+// Express reports an oversized body as an HTML stack, which reaches the setup
+// page as an unreadable failure rather than as the ceiling it is.
+addon.use((err, req, res, next) => {
+  if (err?.type !== 'entity.too.large') return next(err);
+  consola.warn(`[Request] Body over the ${err.limit} byte limit on ${req.method} ${req.path}`);
+  return res.status(413).json({
+    error: 'Configuration is too large to send in one request. An instance administrator can raise Max Request Body Size in the dashboard settings.',
+    limit: err.limit,
+    length: err.length ?? null,
+  });
+});
 
 // Global CORS middleware: ensure every response includes CORS headers
 // This prevents browser blocks when a route returns early or on errors
@@ -188,6 +164,37 @@ addon.use((req, res, next) => {
   next();
 });
 
+const { readiness } = require('./lib/lifecycle/runtime.js');
+const { createReadinessGate } = require('./lib/lifecycle/readiness.js');
+
+addon.get('/health/live', (req, res) => {
+  res.status(200).json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    version: ADDON_VERSION,
+  });
+});
+
+addon.get('/health/ready', (req, res) => {
+  const snapshot = readiness.snapshot();
+  res.status(snapshot.ready ? 200 : 503).json({
+    status: snapshot.ready ? 'ready' : 'starting',
+    ready: snapshot.ready,
+    components: snapshot.components,
+    timestamp: new Date().toISOString(),
+    version: ADDON_VERSION,
+  });
+});
+
+addon.use(createReadinessGate(readiness, { allowPaths: ['/health'] }));
+
+const { createAliasResolutionMiddleware } = require('./lib/aliasMiddleware.js');
+const { resolveAliasSync, isAliasFeatureEnabled } = require('./lib/aliasResolver.js');
+addon.use(createAliasResolutionMiddleware({
+  resolve: resolveAliasSync,
+  isEnabled: isAliasFeatureEnabled,
+}));
+
 // Add request tracking middleware
 addon.use(requestTracker.middleware());
 
@@ -196,6 +203,26 @@ addon.use((req, res, next) => {
   if (m) return runWithRequestContext(m[1], () => next());
   next();
 });
+
+const noStoreOAuthHeaders = (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+};
+addon.use(
+  [
+    '/api/auth/trakt/authorize',
+    '/api/auth/trakt/callback',
+    '/api/auth/simkl/authorize',
+    '/api/auth/simkl/callback',
+    '/api/auth/simkl/pin',
+    '/api/auth/simkl/pin/status',
+    '/api/auth/simkl/pin/cancel',
+    '/api/auth/movielens/connect',
+  ],
+  noStoreOAuthHeaders
+);
 
 function TEST_KEYS_RATE_LIMIT_PER_MIN() { return parseInt(process.env.TEST_KEYS_RATE_LIMIT_PER_MIN || '60', 10); }
 
@@ -225,40 +252,199 @@ async function testKeysRateLimitMiddleware(req, res, next) {
   next();
 }
 
+const REDIS_LIMITER_TIMEOUT_MS = 500;
 
-function POSTER_PROXY_PREFIX_URL() { return (process.env.POSTER_PROXY_PREFIX_URL || '').replace(/\/+$/, ''); }
+function DEVICE_AUTH_POLL_RATE_LIMIT_PER_MIN() {
+  const parsed = parseInt(getSetting('DEVICE_AUTH_POLL_RATE_LIMIT_PER_MIN'), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 240;
+}
 
-// Initialize cache warming for public instances (enabled by default)
-const ENABLE_CACHE_WARMING = process.env.ENABLE_CACHE_WARMING !== 'false';
-const CACHE_WARMING_INTERVAL = parseInt(process.env.CACHE_WARMING_INTERVAL || '720', 10);
+function getManagerSyncHostDelayMs() {
+  const parsed = parseInt(getSetting('MANAGER_SYNC_HOST_DELAY_MS'), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 400;
+}
 
-if (ENABLE_CACHE_WARMING) {
-  consola.info(`[API Cache Warming] Initializing API cache warming (interval: ${CACHE_WARMING_INTERVAL} minutes)`);
+// Own bucket: a pending code polls every few seconds and would eat the much
+// tighter /api/test-keys budget.
+async function deviceAuthPollRateLimitMiddleware(req, res, next) {
+  if (!redis) {
+    return next();
+  }
 
-  // Schedule periodic warming (non-blocking)
-  scheduleEssentialWarming(CACHE_WARMING_INTERVAL);  
-  // Schedule popular content warming based on CACHE_WARM_INTERVAL_HOURS env (default 24h, minimum 12h)
-  const POPULAR_WARM_INTERVAL_HOURS = Math.max(12, parseInt(process.env.CACHE_WARM_INTERVAL_HOURS || '24', 10));
-  const POPULAR_WARM_CHECK_INTERVAL = 15 * 60 * 1000; // Check every 15 minutes
-  
-  consola.info(`[Cache Warming] Scheduling popular content warming (interval: ${POPULAR_WARM_INTERVAL_HOURS}h, check every 15min)`);
-  
-  // Check immediately on startup
-  warmPopularContent().catch(error => {
-    consola.warn('[Cache Warming] Initial popular content warming check failed:', error.message);
-  });
-  
-  // Then check periodically (the function itself will decide if warming is needed)
-  setInterval(async () => {
-    await warmPopularContent().catch(error => {
-      consola.warn('[Cache Warming] Popular content warming check failed:', error.message);
-    });
-  }, POPULAR_WARM_CHECK_INTERVAL);
-} else {
-  consola.info('[Cache Warming] Cache warming disabled or cache disabled');
+  try {
+    const minuteBucket = Math.floor(Date.now() / 60000);
+    // Keyed per caller, the way the config-load limiter is. A single bucket for
+    // the whole instance would let a handful of concurrent authorizations spend
+    // the budget, and would let anyone spend it deliberately: a pending code
+    // polls every few seconds and these routes need no session.
+    const target = (typeof req.query?.sessionId === 'string' && req.query.sessionId)
+      || (typeof req.body?.sessionId === 'string' && req.body.sessionId)
+      || req.session?.accountId
+      || req.ip
+      || 'unknown';
+    const rateKey = `rate-limit:device-auth-poll:${target}:${minuteBucket}`;
+
+    // Bounded: with no Redis listening, ioredis holds a command for the better
+    // part of a minute, and these routes are polled every few seconds. A count
+    // we can't read in time means the request is allowed through.
+    const currentCount = await Promise.race([
+      redis.incr(rateKey),
+      new Promise(resolve => setTimeout(() => resolve(null), REDIS_LIMITER_TIMEOUT_MS).unref()),
+    ]);
+
+    if (currentCount === null) {
+      return next();
+    }
+
+    if (currentCount === 1) {
+      redis.expire(rateKey, 70).catch(() => undefined);
+    }
+
+    if (currentCount > DEVICE_AUTH_POLL_RATE_LIMIT_PER_MIN()) {
+      return res.status(429).json({ error: 'Too many authorization status requests. Please try again shortly.' });
+    }
+  } catch (error) {
+    consola.warn('[Rate Limit] Device auth poll limiter failed, allowing request:', error.message);
+  }
+
+  next();
+}
+
+function CONFIG_LOAD_RATE_LIMIT_PER_MIN() {
+  const parsed = parseInt(require('./lib/settingsService').getSetting('CONFIG_LOAD_RATE_LIMIT_PER_MIN'), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+}
+
+async function configLoadRateLimitMiddleware(req, res, next) {
+  if (!redis) {
+    return next();
+  }
+
+  try {
+    const minuteBucket = Math.floor(Date.now() / 60000);
+    const target = req.params.userUUID
+      || (typeof req.body?.userUUID === 'string' ? req.body.userUUID.trim() : '')
+      || req.session?.accountId
+      || req.ip
+      || 'unknown';
+    const rateKey = `rate-limit:config-load:${target}:${minuteBucket}`;
+    const currentCount = await redis.incr(rateKey);
+
+    if (currentCount === 1) {
+      await redis.expire(rateKey, 70);
+    }
+
+    if (currentCount > CONFIG_LOAD_RATE_LIMIT_PER_MIN()) {
+      return res.status(429).json({ error: 'Too many login attempts. Please try again shortly.' });
+    }
+  } catch (error) {
+    consola.warn('[Rate Limit] /api/config/load limiter failed, allowing request:', error.message);
+  }
+
+  next();
 }
 
 
+const posterCacheConfig = require('./lib/posterCache/config.js');
+const { buildProxyArtUrl, proxyArtUrlVouched } = require('./lib/posterCache/proxyArt.js');
+const { serveStoreResult, servePassThrough, openArtStream } = require('./lib/posterCache/artProxyServe.js');
+
+function POSTER_PROXY_PREFIX_URL() { return posterCacheConfig.getPosterProxyPrefix(); }
+
+
+function applyImageCachePrefix(data) {
+  const prefix = POSTER_PROXY_PREFIX_URL();
+  if (!prefix || !data) return;
+
+  const selfOrigin = posterCacheConfig.getSelfOrigin();
+  const metaFieldClasses = posterCacheConfig.META_FIELD_CLASSES;
+  const cacheThumbnails = posterCacheConfig.isClassEnabled('thumbnail');
+  const cacheCast = posterCacheConfig.isClassEnabled('cast');
+
+  const enabledFields = posterCacheConfig.getCacheableFields();
+  if (enabledFields.length === 0 && !cacheThumbnails && !cacheCast) return;
+
+  const prefixUrl = (url, imageClass) => {
+    if (!url || typeof url !== 'string') return url;
+    if (url.startsWith(prefix)) return url;
+    if (!/^https?:\/\//i.test(url)) return url;
+    if (selfOrigin && url.startsWith(selfOrigin)) return url;
+    return posterCacheConfig.buildCachedUrl(prefix, imageClass, url);
+  };
+
+  const applyToMeta = (meta) => {
+    if (!meta) return;
+    for (const field of enabledFields) {
+      if (meta[field]) meta[field] = prefixUrl(meta[field], metaFieldClasses[field]);
+    }
+    if (cacheThumbnails && Array.isArray(meta.videos)) {
+      for (const video of meta.videos) {
+        if (video?.thumbnail) video.thumbnail = prefixUrl(video.thumbnail, 'thumbnail');
+      }
+    }
+    if (cacheCast && Array.isArray(meta.app_extras?.cast)) {
+      for (const member of meta.app_extras.cast) {
+        if (member?.photo) member.photo = prefixUrl(member.photo, 'cast');
+      }
+    }
+  };
+
+  applyToMeta(data.meta);
+  if (Array.isArray(data.metas)) {
+    for (const meta of data.metas) applyToMeta(meta);
+  }
+}
+
+const isCacheWarmingEnabled = () => process.env.ENABLE_CACHE_WARMING !== 'false';
+
+/** Read at call time so the status route reports a value changed from the dashboard. */
+const cacheWarmingIntervalMinutes = () => parseInt(process.env.CACHE_WARMING_INTERVAL || '720', 10);
+
+/** Called by the startup sequence once settings are loaded. */
+function startEssentialWarmingSchedules() {
+  const CACHE_WARMING_INTERVAL = cacheWarmingIntervalMinutes();
+
+  if (isCacheWarmingEnabled()) {
+    consola.info(`[API Cache Warming] Initializing API cache warming (interval: ${CACHE_WARMING_INTERVAL} minutes)`);
+
+    // Schedule periodic warming (non-blocking)
+    scheduleEssentialWarming(CACHE_WARMING_INTERVAL);  
+    // Schedule popular content warming based on CACHE_WARM_INTERVAL_HOURS env (default 24h, minimum 12h)
+    const POPULAR_WARM_INTERVAL_HOURS = Math.max(12, parseInt(process.env.CACHE_WARM_INTERVAL_HOURS || '24', 10));
+    const POPULAR_WARM_CHECK_INTERVAL = 15 * 60 * 1000; // Check every 15 minutes
+  
+    consola.info(`[Cache Warming] Scheduling popular content warming (interval: ${POPULAR_WARM_INTERVAL_HOURS}h, check every 15min)`);
+  
+    // Check immediately on startup
+    warmPopularContent().catch(error => {
+      consola.warn('[Cache Warming] Initial popular content warming check failed:', error.message);
+    });
+  
+    // Then check periodically (the function itself will decide if warming is needed)
+    setInterval(async () => {
+      await warmPopularContent().catch(error => {
+        consola.warn('[Cache Warming] Popular content warming check failed:', error.message);
+      });
+    }, POPULAR_WARM_CHECK_INTERVAL);
+  } else {
+    consola.info('[Cache Warming] Cache warming disabled or cache disabled');
+  }
+}
+
+/** Called by the startup sequence once settings are loaded. */
+function startMovieLensSyncSchedule() {
+  const ENABLE_MOVIELENS_SYNC = process.env.ENABLE_MOVIELENS_SYNC !== 'false';
+  if (ENABLE_MOVIELENS_SYNC && process.env.MOVIELENS_CRED_KEY) {
+    const MOVIELENS_SYNC_INTERVAL_HOURS = Math.max(1, parseInt(process.env.MOVIELENS_SYNC_INTERVAL_HOURS || '24', 10));
+    const intervalMs = MOVIELENS_SYNC_INTERVAL_HOURS * 60 * 60 * 1000;
+    consola.info(`[MovieLens] Scheduling rating re-sync every ${MOVIELENS_SYNC_INTERVAL_HOURS}h`);
+    setInterval(() => {
+      require('./lib/movielensSync').syncAllMovieLensAccounts().catch(error => {
+        consola.warn('[MovieLens] Scheduled re-sync failed:', error.message);
+      });
+    }, intervalMs);
+  }
+}
 
 const getCacheHeaders = function (opts) {
   opts = opts || {};
@@ -279,7 +465,45 @@ const getCacheHeaders = function (opts) {
   return headerParts.length > 0 ? headerParts.join(", ") : false;
 };
 
-const respond = function (req, res, data, opts) {
+/**
+ * The filtering an install URL asks for, from the profiles it names and from the raw
+ * parameters. One UUID can then serve both an unrestricted and a family install.
+ * Copied rather than assigned onto the config, because concurrent loads for the same
+ * user are coalesced and hand back the same object.
+ */
+
+function applyRatingOverrides(config, req, userUUID) {
+  const rawRating = req.query.contentrating ?? req.query.contentRating;
+  const rawUnrated = req.query.unrated;
+  const rawTag = req.query.tag;
+  if (rawRating === undefined && rawUnrated === undefined && rawTag === undefined) return config;
+
+  const { tags: urlTags } = resolveManifestTags(config, rawTag);
+  const tags = scopeTagsToCatalog(config, urlTags, req.params.id, req.params.type);
+  const { ageRating, allowUnrated, refused } = resolveInstallFilters(config, {
+    rating: rawRating,
+    unrated: rawUnrated,
+    tags,
+  });
+  if (refused.length > 0) {
+    consola.warn(`[Rating] User ${userUUID} asked for ${refused.join(', ')}, which does not tighten their configured ${config.ageRating || 'None'}`);
+  }
+
+  const hidesUnrated = allowUnrated === false && allowsUnrated(config);
+  const showsUnrated = allowUnrated === true && !allowsUnrated(config);
+  if (!ageRating && !hidesUnrated && !showsUnrated) return config;
+
+  const next = { ...config };
+  if (ageRating) {
+    next.ageRating = ageRating;
+    next._ratingOverride = ageRating;
+  }
+  if (hidesUnrated || showsUnrated) next.allowUnratedContent = !hidesUnrated;
+  consola.debug(`[Rating] User ${userUUID} install capped at ${next.ageRating}${hidesUnrated ? ', unrated hidden' : ''} (configured ${config.ageRating || 'None'}${tags.length ? `, profiles ${tags.join(', ')}` : ''})`);
+  return next;
+}
+
+const respond = function (req, res, data, opts?) {
   // Store minimal tracking data in res.locals for success detection
   if (req.path.includes('/catalog/') && data && data.metas) {
     res.locals.resultCount = data.metas.length;
@@ -306,8 +530,10 @@ const respond = function (req, res, data, opts) {
         etagContent += ':manifest';
       }
 
-      if (typeof req.query.tag === 'string' && req.query.tag.trim()) {
-        etagContent += ':tag:' + req.query.tag.trim().toLowerCase();
+      // Set by the manifest route once the query has been resolved, so the validator
+      // follows the profiles that were actually built rather than the raw query.
+      if (Array.isArray(req.manifestTags) && req.manifestTags.length > 0) {
+        etagContent += ':tags:' + req.manifestTags.map((t) => t.toLowerCase()).join(',');
       }
 
       const etagHash = crypto.createHash('md5').update(etagContent).digest('hex');
@@ -372,24 +598,7 @@ const respond = function (req, res, data, opts) {
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Content-Type", "application/json");
 
-  // Prefix poster URLs with reverse proxy URL for local caching
-  const posterProxyUrl = POSTER_PROXY_PREFIX_URL();
-  if (posterProxyUrl && data) {
-    const prefixPoster = (url) => {
-      if (!url || url.startsWith(posterProxyUrl)) return url;
-      return `${posterProxyUrl}/${url}`;
-    };
-    if (data.meta?.poster) {
-      data.meta.poster = prefixPoster(data.meta.poster);
-    }
-    if (data.metas) {
-      for (const meta of data.metas) {
-        if (meta.poster) {
-          meta.poster = prefixPoster(meta.poster);
-        }
-      }
-    }
-  }
+  applyImageCachePrefix(data);
 
   stripReleaseAvailabilityForResponse(data);
   res.send(data);
@@ -415,13 +624,19 @@ const respond = function (req, res, data, opts) {
       gemini: getSetting('GEMINI_API_KEY'),
       trakt: getSetting('TRAKT_CLIENT_ID'),
       simkl: getSetting('SIMKL_CLIENT_ID'),
+      simklAuthMode: resolveSimklAuthMode(),
       customDescriptionBlurb: getSetting('CUSTOM_DESCRIPTION_BLURB'),
       addonVersion: ADDON_VERSION,
       hasBuiltInTvdb: !!getSetting('BUILT_IN_TVDB_API_KEY'),
       hasBuiltInTmdb: !!getSetting('BUILT_IN_TMDB_API_KEY'),
+      hasBuiltInMdblist: !!getSetting('BUILT_IN_MDBLIST_API_KEY'),
+      hasBuiltInGemini: !!getSetting('BUILT_IN_GEMINI_API_KEY'),
       catalogTTL: parseInt(getSetting('CATALOG_TTL') || String(24 * 60 * 60), 10),
+      maxCatalogs: parseInt(getSetting('MAX_CATALOGS') || '', 10) || null,
+      collectionImportCatalogCap: parseInt(getSetting('COLLECTION_IMPORT_CATALOG_CAP') || '', 10) || 400,
       simklTrendingPageSizeOptions: resolvedOptions,
       traktSearchEnabled: getSetting('DISABLE_TRAKT_SEARCH') !== 'true',
+      simklSearchEnabled: getSetting('DISABLE_SIMKL_SEARCH') !== 'true',
     };
     
     // No cache to prevent cross-instance contamination
@@ -440,9 +655,20 @@ const respond = function (req, res, data, opts) {
     });
   });
 
+// --- Authentication and config profiles ---
+require('./lib/authRoutes').register(addon, {
+  rateLimit: configLoadRateLimitMiddleware,
+  requireAdmin: requireDashboardAdmin,
+});
+const { requireSigninForAppPages, requireSigninForApi, isAuthenticatedRequest, respondIfSigninRequired } = require('./lib/signinGate');
+const { runWithRequestAuth } = require('./lib/requestSession');
+addon.use((req, _res, next) => runWithRequestAuth(isAuthenticatedRequest(req), next));
+addon.use(requireSigninForAppPages);
+addon.use(requireSigninForApi);
+
 // --- Configuration Database API Routes ---
 addon.post("/api/config/save", configApi.saveConfig.bind(configApi));
-addon.post("/api/config/load/:userUUID", configApi.loadConfig.bind(configApi));
+addon.post("/api/config/load/:userUUID", configLoadRateLimitMiddleware, configApi.loadConfig.bind(configApi));
 addon.put("/api/config/update/:userUUID", configApi.updateConfig.bind(configApi));
 addon.post("/api/config/migrate", configApi.migrateFromLocalStorage.bind(configApi));
 addon.get('/api/config/is-trusted/:uuid', configApi.isTrusted.bind(configApi));
@@ -461,7 +687,7 @@ addon.get("/api/auth/trakt/authorize", async (req, res) => {
     
     const traktClient = new TraktClient(clientId, clientSecret, redirectUri);
     
-    const state = createTraktOAuthState();
+    const state = createTraktOAuthState(clientSecret, TRAKT_OAUTH_STATE_TTL_MS);
     const authUrl = traktClient.getAuthorizationUrl(state);
     
     res.redirect(authUrl);
@@ -471,12 +697,8 @@ addon.get("/api/auth/trakt/authorize", async (req, res) => {
   }
 });
 
+// Coalesce duplicate exchanges handled by this process only.
 const pendingTraktExchanges = new Map();
-
-// Helper: sleep with ms
-function sleepMs(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 async function exchangeWithRetry(traktClient, code, maxRetries = 3) {
   let lastError;
@@ -509,7 +731,7 @@ async function exchangeWithRetry(traktClient, code, maxRetries = 3) {
           `Waiting ${waitSeconds}s before retry...`
         );
 
-        await sleepMs(waitSeconds * 1000);
+        await sleep(waitSeconds * 1000);
         continue;
       }
 
@@ -527,44 +749,35 @@ addon.get("/api/auth/trakt/callback", async (req, res) => {
     const state = Array.isArray(req.query.state) ? req.query.state[0] : req.query.state;
 
     if (!code) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ OAuth Error</h1>
-          <p>Invalid callback parameters - missing authorization code.</p>
-        </body>
-        </html>
-      `);
+      return res.status(400).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'error',
+        title: 'Authorization incomplete',
+        message: 'Trakt did not return an authorization code. Please start the connection again.',
+        retryHref: '/api/auth/trakt/authorize',
+      }));
     }
 
     if (usedTraktCodes.has(code)) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>⚠️ Code Already Used</h1>
-          <p>This authorization code has already been exchanged. Please try authenticating again.</p>
-          <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Reconnect Trakt</a>
-        </body>
-        </html>
-      `);
+      return res.status(400).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'warning',
+        title: 'Authorization already used',
+        message: 'This authorization has already been completed. Start a new connection if you need another token.',
+        retryHref: '/api/auth/trakt/authorize',
+        retryLabel: 'Reconnect Trakt',
+      }));
     }
 
-    if (!state || !consumeTraktOAuthState(state)) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>OAuth State Error</h1>
-          <p>The OAuth state is missing, expired, or invalid. Please try again.</p>
-          <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Reconnect Trakt</a>
-        </body>
-        </html>
-      `);
+    const clientSecret = process.env.TRAKT_CLIENT_SECRET;
+    if (!state || !verifyTraktOAuthState(state, clientSecret)) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'error',
+        title: 'Connection expired',
+        message: 'The secure authorization state is missing, invalid, or expired. Please start again.',
+        retryHref: '/api/auth/trakt/authorize',
+      }));
     }
 
     if (pendingTraktExchanges.has(code)) {
@@ -572,48 +785,35 @@ addon.get("/api/auth/trakt/callback", async (req, res) => {
       try {
         await pendingTraktExchanges.get(code);
 
-        return res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head><title>Trakt OAuth</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1>⏳ Processing</h1>
-            <p>Your Trakt authorization is already being processed. Please check your other tab/window.</p>
-          </body>
-          </html>
-        `);
+        return res.send(renderOAuthPage({
+          provider: 'trakt',
+          status: 'info',
+          title: 'Connection in progress',
+          message: 'Your Trakt authorization is already being processed. You can close this window and check the original tab.',
+        }));
       } catch {
-        return res.status(500).send(`
-          <!DOCTYPE html>
-          <html>
-          <head><title>Trakt OAuth Error</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1>❌ Exchange Failed</h1>
-            <p>The token exchange failed. Please try authenticating again.</p>
-            <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Reconnect Trakt</a>
-          </body>
-          </html>
-        `);
+        return res.status(500).send(renderOAuthPage({
+          provider: 'trakt',
+          status: 'error',
+          title: 'Connection failed',
+          message: 'Trakt could not complete the token exchange. Please start the connection again.',
+          retryHref: '/api/auth/trakt/authorize',
+        }));
       }
     }
 
     const clientId = process.env.TRAKT_CLIENT_ID;
-    const clientSecret = process.env.TRAKT_CLIENT_SECRET;
     const redirectUri = normalizeRedirectUri(
       process.env.TRAKT_REDIRECT_URI || `${process.env.HOST_NAME}/api/auth/trakt/callback`
     );
 
     if (!clientId || !clientSecret) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>⚠️ Configuration Error</h1>
-          <p>Trakt OAuth is not configured on this server.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'warning',
+        title: 'Trakt is not configured',
+        message: 'This server is missing the credentials required to connect a Trakt account.',
+      }));
     }
 
     const traktClient = new TraktClient(clientId, clientSecret, redirectUri);
@@ -633,33 +833,23 @@ addon.get("/api/auth/trakt/callback", async (req, res) => {
       if (tokenError.response?.status === 429) {
         const retryAfter = tokenError.response.headers?.['retry-after'] || 60;
         const waitSeconds = Math.min(Math.max(Number(retryAfter), 30), 300);
-        return res.status(429).send(`
-          <!DOCTYPE html>
-          <html>
-          <head><title>Trakt Rate Limited</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1>⏳ Rate Limited</h1>
-            <p>Trakt's API is temporarily rate-limited. Please wait and try again.</p>
-            <p>Estimated wait: <strong>${waitSeconds} seconds</strong></p>
-            <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Try Again</a>
-            <br><br>
-            <a href="/configure" style="color: #666; text-decoration: underline;">Return to configuration</a>
-          </body>
-          </html>
-        `);
+        return res.status(429).send(renderOAuthPage({
+          provider: 'trakt',
+          status: 'warning',
+          title: 'Trakt is temporarily busy',
+          message: 'The Trakt API is rate-limiting new connections. Wait a moment, then try again.',
+          detail: `Estimated wait: ${waitSeconds} seconds.`,
+          retryHref: '/api/auth/trakt/authorize',
+        }));
       }
 
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ Exchange Failed</h1>
-          <p>Failed to exchange authorization code: ${tokenError.message}</p>
-          <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Try Again</a>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'error',
+        title: 'Connection failed',
+        message: 'The authorization code could not be exchanged for a Trakt token. Please try again.',
+        retryHref: '/api/auth/trakt/authorize',
+      }));
     } finally {
       pendingTraktExchanges.delete(code);
     }
@@ -698,16 +888,13 @@ addon.get("/api/auth/trakt/callback", async (req, res) => {
     }
 
     if (!saved) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Trakt OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ Database Error</h1>
-          <p>Failed to save OAuth token to database.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'trakt',
+        status: 'error',
+        title: 'Token could not be saved',
+        message: 'Trakt authorized the connection, but this server could not store the token. Please try again.',
+        retryHref: '/api/auth/trakt/authorize',
+      }));
     }
 
     try {
@@ -726,70 +913,24 @@ addon.get("/api/auth/trakt/callback", async (req, res) => {
       consola.warn(`[Trakt OAuth] Warning: Could not auto-update user configs - ${configError.message}`);
     }
 
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Trakt OAuth Success</title>
-        <style>
-          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
-          .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          h1 { color: #ed1c24; }
-          .token-box { background: #f9f9f9; border: 2px dashed #ed1c24; padding: 20px; margin: 20px 0; border-radius: 5px; word-break: break-all; }
-          .token { font-family: monospace; font-size: 14px; color: #333; }
-          button { background: #ed1c24; color: white; border: none; padding: 12px 30px; font-size: 16px; cursor: pointer; border-radius: 5px; margin: 10px; }
-          button:hover { background: #c41a20; }
-          .instructions { text-align: left; margin-top: 30px; padding: 20px; background: #f0f8ff; border-left: 4px solid #007acc; }
-          .instructions ol { padding-left: 20px; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>✅ Trakt OAuth Successful</h1>
-          <p>Your Trakt account <strong>${user.username}</strong> has been authorized!</p>
-          <div class="token-box">
-            <div class="token" id="tokenId">${tokenId}</div>
-          </div>
-          <button onclick="copyToken()">📋 Copy Token ID</button>
-          <div class="instructions">
-            <h3>📝 Next Steps:</h3>
-            <ol>
-              <li>Copy the Token ID above</li>
-              <li>Go to your addon configuration page</li>
-              <li>Find the <strong>Trakt Integration</strong> section</li>
-              <li>Paste this Token ID in the <strong>Trakt Token ID</strong> field</li>
-              <li>Save your configuration</li>
-            </ol>
-            <p><strong>⚠️ Important:</strong> Keep this Token ID private. Anyone with this ID can access your Trakt account through this addon.</p>
-          </div>
-        </div>
-        <script>
-          function copyToken() {
-            const tokenText = document.getElementById('tokenId').textContent;
-            navigator.clipboard.writeText(tokenText).then(() => {
-              const btn = event.target;
-              btn.textContent = '✅ Copied!';
-              setTimeout(() => btn.textContent = '📋 Copy Token ID', 2000);
-            });
-          }
-        </script>
-      </body>
-      </html>
-    `);
+    res.send(renderOAuthPage({
+      provider: 'trakt',
+      status: 'success',
+      title: 'Trakt connected',
+      message: 'Authorization is complete. Copy the token ID and paste it into the Trakt integration settings.',
+      username: user.username,
+      tokenId,
+    }));
 
   } catch (error) {
     consola.error("[Trakt OAuth] Unexpected callback error:", error);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-      <head><title>Trakt OAuth Error</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1>❌ Unexpected Error</h1>
-        <p>${error.message || 'An unexpected error occurred during authorization.'}</p>
-        <a href="/api/auth/trakt/authorize" style="display:inline-block;margin-top:20px;padding:12px 30px;background:#ed1c24;color:white;text-decoration:none;border-radius:5px;">Try Again</a>
-      </body>
-      </html>
-    `);
+    res.status(500).send(renderOAuthPage({
+      provider: 'trakt',
+      status: 'error',
+      title: 'Something went wrong',
+      message: 'An unexpected error interrupted the Trakt connection. Please try again.',
+      retryHref: '/api/auth/trakt/authorize',
+    }));
   }
 });
 
@@ -807,7 +948,7 @@ addon.post("/api/oauth/token/info", async (req, res) => {
     if (!token) {
       return res.status(404).json({ error: "Token not found" });
     }
-    const response = { provider: token.provider, username: token.user_id, expiresAt: token.expires_at };
+    const response: any = { provider: token.provider, username: token.user_id, expiresAt: token.expires_at };
     if (token.provider === 'trakt') {
       try {
         const { isTokenInvalidated } = require('./utils/traktUtils');
@@ -824,6 +965,141 @@ addon.post("/api/oauth/token/info", async (req, res) => {
   }
 });
 
+// --- MovieLens Connect ---
+addon.post("/api/auth/movielens/connect", async (req, res) => {
+  try {
+    const { userName, password } = req.body || {};
+    if (!userName || !password) {
+      return res.status(400).json({ error: "userName and password are required" });
+    }
+    if (!process.env.MOVIELENS_CRED_KEY) {
+      return res.status(500).json({ error: "MovieLens is not configured on this server (MOVIELENS_CRED_KEY is missing)." });
+    }
+    const credId = await movielens.connect(userName, password);
+    consola.info(`[MovieLens] Connected account ${userName} (cred ${credId})`);
+    res.json({ success: true, credId, userName });
+  } catch (error) {
+    if (error instanceof movielens.MovieLensAuthError) {
+      return res.status(401).json({ error: "MovieLens rejected the username or password." });
+    }
+    consola.error("[MovieLens] Connect error:", error);
+    res.status(500).json({ error: "Could not connect to MovieLens. Please try again." });
+  }
+});
+
+// --- MovieLens Sync / Bootstrap ---
+addon.post("/api/movielens/sync/:userUUID", async (req, res) => {
+  try {
+    const { userUUID } = req.params;
+    const { password, full, credId: bodyCredId } = req.body || {};
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const config = access.config;
+    if (!config.apiKeys?.movieLensCredId && bodyCredId) {
+      const credRow = await database.getOAuthToken(bodyCredId);
+      if (credRow && credRow.provider === 'movielens') {
+        config.apiKeys = { ...config.apiKeys, movieLensCredId: bodyCredId };
+      }
+    }
+    if (!config.apiKeys?.movieLensCredId) {
+      return res.status(400).json({ error: "No MovieLens account is connected." });
+    }
+    const cooldownSeconds = parseInt(process.env.MOVIELENS_MANUAL_SYNC_COOLDOWN_SECONDS || '21600', 10);
+    const movielensSync = require('./lib/movielensSync');
+    const result = await movielensSync.syncMovieLensAccount(config, { full: !!full, cooldownSeconds });
+    if (!result.ok) {
+      if (result.reason === 'cooldown') {
+        return res.status(429).json({
+          error: "You've synced recently. Please try again later.",
+          nextAllowedInSeconds: result.nextAllowedInSeconds,
+        });
+      }
+      return res.status(400).json({ error: `MovieLens sync could not run (${result.reason || 'unknown'}).` });
+    }
+    consola.info(`[MovieLens] Sync for ${userUUID}: sent ${result.sent || 0} ratings, MovieLens reports ${result.successCount || 0} new`);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof movielens.MovieLensAuthError) {
+      return res.status(401).json({ error: "Your MovieLens session could not be refreshed. Please reconnect your account." });
+    }
+    consola.error("[MovieLens] Sync error:", error);
+    res.status(500).json({ error: "MovieLens sync failed. Please try again." });
+  }
+});
+
+addon.post("/api/movielens/lists/:userUUID", async (req, res) => {
+  try {
+    const { userUUID } = req.params;
+    const { password } = req.body || {};
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const credId = access.config.apiKeys?.movieLensCredId;
+    if (!credId) {
+      return res.status(400).json({ error: "No MovieLens account is connected." });
+    }
+    const lists = await movielens.getLists(credId);
+    res.json({ lists: Array.isArray(lists) ? lists : [] });
+  } catch (error) {
+    if (error instanceof movielens.MovieLensAuthError) {
+      return res.status(401).json({ error: "Your MovieLens session could not be refreshed. Please reconnect your account." });
+    }
+    consola.error("[MovieLens] Lists error:", error);
+    res.status(500).json({ error: "Could not fetch MovieLens lists." });
+  }
+});
+
+// Saves a new Simkl access token and returns the token ID the user pastes into
+// their config. Used by both the OAuth callback and the PIN flow.
+async function persistSimklToken(user, accessToken) {
+  // Check if this Simkl user already has a token in the database
+  const existingTokens = await database.getOAuthTokensByProvider('simkl');
+  const existingToken = existingTokens.find(t => t.user_id.toLowerCase() === user.username.toLowerCase());
+
+  let tokenId;
+  let saved;
+
+  if (existingToken) {
+    // Update existing token
+    tokenId = existingToken.id;
+    consola.info(`[Simkl OAuth] Updating existing token - tokenId: ${tokenId}, user: ${user.username}`);
+
+    // Simkl tokens don't expire, so we don't have expires_at
+    saved = await database.updateOAuthToken(tokenId, accessToken, '', 0);
+  } else {
+    // Create new token
+    tokenId = crypto.randomUUID();
+    consola.info(`[Simkl OAuth] Creating new token - tokenId: ${tokenId}, user: ${user.username}`);
+
+    saved = await database.saveOAuthToken(tokenId, 'simkl', user.username, accessToken, '', 0, '');
+  }
+
+  if (!saved) {
+    return null;
+  }
+
+  try {
+    const userSimklTokens = existingTokens.filter(t => t.user_id.toLowerCase() === user.username.toLowerCase());
+    const oldTokenIds = userSimklTokens.map(t => t.id).filter(id => id !== tokenId);
+    if (oldTokenIds.length > 0) {
+      const affectedUsers = await database.getUsersByOAuthTokenIds('simklTokenId', oldTokenIds);
+      for (const dbUser of affectedUsers) {
+        dbUser.config.apiKeys.simklTokenId = tokenId;
+        await database.saveUserConfig(dbUser.id, dbUser.password_hash, dbUser.config);
+        configCache.del(dbUser.id);
+        consola.info(`[Simkl OAuth] Updated user ${dbUser.id} config to use new token ${tokenId}`);
+      }
+    }
+  } catch (configError) {
+    consola.warn(`[Simkl OAuth] Warning: Could not auto-update user configs - ${configError.message}`);
+  }
+
+  return tokenId;
+}
+
 // --- Simkl OAuth Routes ---
 addon.get("/api/auth/simkl/authorize", async (req, res) => {
   try {
@@ -837,8 +1113,8 @@ addon.get("/api/auth/simkl/authorize", async (req, res) => {
     
     const simklClient = new SimklClient(clientId, clientSecret, redirectUri);
     
-    // Get authorization URL
-    const authUrl = simklClient.getAuthorizationUrl();
+    const state = createSimklOAuthState(clientSecret, SIMKL_OAUTH_STATE_TTL_MS);
+    const authUrl = simklClient.getAuthorizationUrl(state);
     
     res.redirect(authUrl);
   } catch (error) {
@@ -849,19 +1125,19 @@ addon.get("/api/auth/simkl/authorize", async (req, res) => {
 
 addon.get("/api/auth/simkl/callback", async (req, res) => {
   try {
-    const { code } = req.query;
+    const codeParam = Array.isArray(req.query.code) ? req.query.code[0] : req.query.code;
+    const stateParam = Array.isArray(req.query.state) ? req.query.state[0] : req.query.state;
+    const code = typeof codeParam === 'string' ? codeParam : '';
+    const state = typeof stateParam === 'string' ? stateParam : '';
     
     if (!code) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Simkl OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ OAuth Error</h1>
-          <p>Invalid callback parameters - missing authorization code.</p>
-        </body>
-        </html>
-      `);
+      return res.status(400).send(renderOAuthPage({
+        provider: 'simkl',
+        status: 'error',
+        title: 'Authorization incomplete',
+        message: 'Simkl did not return an authorization code. Please start the connection again.',
+        retryHref: '/api/auth/simkl/authorize',
+      }));
     }
     
     const clientId = process.env.SIMKL_CLIENT_ID;
@@ -869,16 +1145,22 @@ addon.get("/api/auth/simkl/callback", async (req, res) => {
     const redirectUri = normalizeRedirectUri(process.env.SIMKL_REDIRECT_URI || `${process.env.HOST_NAME}/api/auth/simkl/callback`);
     
     if (!clientId || !clientSecret) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Simkl OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>⚠️ Configuration Error</h1>
-          <p>Simkl OAuth is not configured on this server.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'simkl',
+        status: 'warning',
+        title: 'Simkl is not configured',
+        message: 'This server is missing the credentials required to connect a Simkl account.',
+      }));
+    }
+
+    if (!verifySimklOAuthState(state, clientSecret)) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'simkl',
+        status: 'error',
+        title: 'Connection expired',
+        message: 'The secure authorization state is missing, invalid, or expired. Please start again.',
+        retryHref: '/api/auth/simkl/authorize',
+      }));
     }
     
     const simklClient = new SimklClient(clientId, clientSecret, redirectUri);
@@ -889,138 +1171,35 @@ addon.get("/api/auth/simkl/callback", async (req, res) => {
     // Get user info
     const user = await simklClient.getMe(tokens.access_token);
     
-    // Check if this Simkl user already has a token in the database
-    const existingTokens = await database.getOAuthTokensByProvider('simkl');
-    const existingToken = existingTokens.find(t => t.user_id.toLowerCase() === user.username.toLowerCase());
+    const tokenId = await persistSimklToken(user, tokens.access_token);
     
-    let tokenId;
-    let saved;
-    
-    if (existingToken) {
-      // Update existing token
-      tokenId = existingToken.id;
-      consola.info(`[Simkl OAuth] Updating existing token - tokenId: ${tokenId}, user: ${user.username}`);
-      
-      // Simkl tokens don't expire, so we don't have expires_at
-      saved = await database.updateOAuthToken(
-        tokenId,
-        tokens.access_token,
-        '', 
-        0 
-      );
-    } else {
-      // Create new token
-      tokenId = crypto.randomUUID();
-      consola.info(`[Simkl OAuth] Creating new token - tokenId: ${tokenId}, user: ${user.username}`);
-      
-      saved = await database.saveOAuthToken(
-        tokenId,
-        'simkl',
-        user.username,
-        tokens.access_token,
-        '', 
-        0, 
-        '' 
-      );
+    if (!tokenId) {
+      return res.status(500).send(renderOAuthPage({
+        provider: 'simkl',
+        status: 'error',
+        title: 'Token could not be saved',
+        message: 'Simkl authorized the connection, but this server could not store the token. Please try again.',
+        retryHref: '/api/auth/simkl/authorize',
+      }));
     }
-    
-    if (!saved) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Simkl OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ Database Error</h1>
-          <p>Failed to save OAuth token to database.</p>
-        </body>
-        </html>
-      `);
-    }
-    
-    try {
-      const userSimklTokens = existingTokens.filter(t => t.user_id.toLowerCase() === user.username.toLowerCase());
-      const oldTokenIds = userSimklTokens.map(t => t.id).filter(id => id !== tokenId);
-      if (oldTokenIds.length > 0) {
-        const affectedUsers = await database.getUsersByOAuthTokenIds('simklTokenId', oldTokenIds);
-        for (const dbUser of affectedUsers) {
-          dbUser.config.apiKeys.simklTokenId = tokenId;
-          await database.saveUserConfig(dbUser.id, dbUser.password_hash, dbUser.config);
-          configCache.del(dbUser.id);
-          consola.info(`[Simkl OAuth] Updated user ${dbUser.id} config to use new token ${tokenId}`);
-        }
-      }
-    } catch (configError) {
-      consola.warn(`[Simkl OAuth] Warning: Could not auto-update user configs - ${configError.message}`);
-    }
-    
-    // Display success page with token ID
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Simkl OAuth Success</title>
-        <style>
-          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
-          .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          h1 { color: #ff6b35; }
-          .token-box { background: #f9f9f9; border: 2px dashed #ff6b35; padding: 20px; margin: 20px 0; border-radius: 5px; word-break: break-all; }
-          .token { font-family: monospace; font-size: 14px; color: #333; }
-          button { background: #ff6b35; color: white; border: none; padding: 12px 30px; font-size: 16px; cursor: pointer; border-radius: 5px; margin: 10px; }
-          button:hover { background: #e55a2b; }
-          .instructions { text-align: left; margin-top: 30px; padding: 20px; background: #f0f8ff; border-left: 4px solid #007acc; }
-          .instructions ol { padding-left: 20px; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>✅ Simkl OAuth Successful</h1>
-          <p>Your Simkl account <strong>${user.username}</strong> has been authorized!</p>
-          
-          <div class="token-box">
-            <div class="token" id="tokenId">${tokenId}</div>
-          </div>
-          
-          <button onclick="copyToken()">📋 Copy Token ID</button>
-          
-          <div class="instructions">
-            <h3>📝 Next Steps:</h3>
-            <ol>
-              <li>Copy the Token ID above</li>
-              <li>Go to your addon configuration page</li>
-              <li>Find the <strong>Simkl Integration</strong> section</li>
-              <li>Paste this Token ID in the <strong>Simkl Token ID</strong> field</li>
-              <li>Save your configuration</li>
-            </ol>
-            <p><strong>⚠️ Important:</strong> Keep this Token ID private. Anyone with this ID can access your Simkl account through this addon.</p>
-          </div>
-        </div>
-        
-        <script>
-          function copyToken() {
-            const tokenText = document.getElementById('tokenId').textContent;
-            navigator.clipboard.writeText(tokenText).then(() => {
-              alert('✅ Token ID copied to clipboard!');
-            }).catch(err => {
-              alert('❌ Failed to copy. Please select and copy manually.');
-            });
-          }
-        </script>
-      </body>
-      </html>
-    `);
+
+    res.send(renderOAuthPage({
+      provider: 'simkl',
+      status: 'success',
+      title: 'Simkl connected',
+      message: 'Authorization is complete. Copy the token ID and paste it into the Simkl integration settings.',
+      username: user.username,
+      tokenId,
+    }));
   } catch (error) {
     consola.error("[Simkl OAuth] Callback error:", error);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-      <head><title>Simkl OAuth Error</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1>❌ OAuth Error</h1>
-        <p>An error occurred during authentication: ${error.message}</p>
-        <p><a href="${process.env.HOST_NAME}/configure">← Back to Configuration</a></p>
-      </body>
-      </html>
-    `);
+    res.status(500).send(renderOAuthPage({
+      provider: 'simkl',
+      status: 'error',
+      title: 'Something went wrong',
+      message: 'An unexpected error interrupted the Simkl connection. Please try again.',
+      retryHref: '/api/auth/simkl/authorize',
+    }));
   }
 });
 
@@ -1063,11 +1242,137 @@ addon.post("/api/auth/trakt/disconnect", async (req, res) => {
     // Invalidate config cache
     configCache.del(userUUID);
     
-    res.json({ success: true });
+    // `removed` says exactly what this disconnect took out, so a page holding
+    // unsaved edits can apply the same removals instead of adopting the whole
+    // saved document and losing them.
+    res.json({ success: true, config, removed: { apiKeys: ['traktTokenId'], fields: ['traktUser', 'traktWatchTracking'], catalogIdPrefix: 'trakt.' } });
   } catch (error) {
     consola.error("[Trakt] Disconnect error:", error);
     res.status(500).json({ error: "Failed to disconnect Trakt" });
   }
+});
+
+// Drops a pending session so a cancelled code doesn't linger until it expires.
+// Knowing the session id is the only thing needed, same as polling it.
+async function handleDeviceAuthCancel(req, res, provider) {
+  try {
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+    const session = await getDeviceAuthSession(sessionId, provider);
+    if (session) {
+      await deleteDeviceAuthSession(sessionId);
+    }
+    res.json({ cancelled: !!session });
+  } catch (error) {
+    consola.error(`[${provider}] Failed to cancel the authorization session:`, error);
+    res.status(500).json({ error: "Failed to cancel the authorization" });
+  }
+}
+
+// --- Simkl PIN (device) Routes ---
+// No client secret and no reachable callback URL needed, so these work on
+// private instances where the OAuth flow can't.
+addon.post("/api/auth/simkl/pin", deviceAuthPollRateLimitMiddleware, async (req, res) => {
+  try {
+    if (!simklPinEnabled()) {
+      return res.status(404).json({ error: "Simkl PIN authentication is not enabled on this instance." });
+    }
+
+    const clientId = getSetting('SIMKL_CLIENT_ID');
+    if (!clientId) {
+      return res.status(500).json({ error: "Simkl is not configured. Please set the SIMKL_CLIENT_ID environment variable." });
+    }
+
+    const simklClient = new SimklClient(clientId);
+    const pin = await simklClient.requestPin();
+
+    const sessionId = createSessionId();
+    const expiresAt = Date.now() + pin.expires_in * 1000;
+    await saveDeviceAuthSession(sessionId, {
+      provider: 'simkl',
+      userCode: pin.user_code,
+      expiresAt,
+      pollIntervalMs: pin.interval * 1000,
+      lastPolledAt: 0,
+    });
+
+    res.json({
+      sessionId,
+      userCode: pin.user_code,
+      verificationUrl: pin.verification_url,
+      interval: pin.interval,
+      expiresIn: pin.expires_in,
+    });
+  } catch (error) {
+    consola.error("[Simkl PIN] Failed to request a PIN:", error);
+    res.status(500).json({ error: "Failed to request a Simkl PIN" });
+  }
+});
+
+addon.get("/api/auth/simkl/pin/status", deviceAuthPollRateLimitMiddleware, async (req, res) => {
+  try {
+    if (!simklPinEnabled()) {
+      return res.status(404).json({ error: "Simkl PIN authentication is not enabled on this instance." });
+    }
+
+    const clientId = getSetting('SIMKL_CLIENT_ID');
+    if (!clientId) {
+      return res.status(500).json({ error: "Simkl is not configured. Please set the SIMKL_CLIENT_ID environment variable." });
+    }
+
+    const sessionIdParam = Array.isArray(req.query.sessionId) ? req.query.sessionId[0] : req.query.sessionId;
+    const sessionId = typeof sessionIdParam === 'string' ? sessionIdParam : '';
+
+    // The session id stays in the browser that started the flow, so guessing the
+    // short user code isn't enough to claim the token.
+    const session = await getDeviceAuthSession(sessionId, 'simkl');
+    if (!session) {
+      return res.status(404).json({ status: 'expired' });
+    }
+
+    // Simkl asks callers to respect the interval it handed out, so polls that
+    // arrive early are answered without bothering it.
+    if (!await registerPoll(sessionId, session)) {
+      return res.json({ status: 'pending' });
+    }
+
+    const simklClient = new SimklClient(clientId);
+    const poll = await simklClient.pollPin(session.userCode);
+
+    if (poll.status === 'pending') {
+      return res.json({ status: 'pending' });
+    }
+
+    if (poll.status === 'slow_down') {
+      await widenPollInterval(sessionId, session);
+      return res.json({ status: 'slow_down' });
+    }
+
+    if (poll.status === 'expired') {
+      await deleteDeviceAuthSession(sessionId);
+      return res.json({ status: 'expired' });
+    }
+
+    const user = await simklClient.getMe(poll.access_token);
+    const tokenId = await persistSimklToken(user, poll.access_token);
+
+    if (!tokenId) {
+      // Session left in place: storing the token is the only thing that failed,
+      // so the next poll can try again rather than making the user start over.
+      return res.status(500).json({ error: "Simkl authorized the connection, but this server could not store the token." });
+    }
+
+    await deleteDeviceAuthSession(sessionId);
+
+    consola.info(`[Simkl PIN] Connected user ${user.username} - tokenId: ${tokenId}`);
+    res.json({ status: 'authorized', tokenId, username: user.username });
+  } catch (error) {
+    consola.error("[Simkl PIN] Status check failed:", error);
+    res.status(500).json({ error: "Failed to check the Simkl PIN status" });
+  }
+});
+
+addon.post("/api/auth/simkl/pin/cancel", async (req, res) => {
+  await handleDeviceAuthCancel(req, res, 'simkl');
 });
 
 addon.post("/api/auth/simkl/disconnect", async (req, res) => {
@@ -1108,69 +1413,16 @@ addon.post("/api/auth/simkl/disconnect", async (req, res) => {
     // Invalidate config cache
     configCache.del(userUUID);
     
-    res.json({ success: true });
+    // `removed` says exactly what this disconnect took out, so a page holding
+    // unsaved edits can apply the same removals instead of adopting the whole
+    // saved document and losing them.
+    res.json({ success: true, config, removed: { apiKeys: ['simklTokenId'], fields: ['simklUser', 'simklWatchTracking'], catalogIdPrefix: 'simkl.' } });
   } catch (error) {
     consola.error("[Simkl] Disconnect error:", error);
     res.status(500).json({ error: "Failed to disconnect Simkl" });
   }
 });
 
-function normalizeTraktEndpoint(endpoint) {
-  if (typeof endpoint !== 'string') return '';
-  const normalized = endpoint.trim();
-  if (!normalized) return '';
-  return normalized.startsWith('/') ? normalized : `/${normalized}`;
-}
-
-function isOptionalUsersRoute(pathnameLower) {
-  const parts = pathnameLower.split('/').filter(Boolean);
-  // /users/{id}
-  if (parts.length === 2) return true;
-  // /users/{id}/stats
-  if (parts.length === 3 && parts[2] === 'stats') return true;
-  // /users/{id}/lists
-  if (parts.length === 3 && parts[2] === 'lists') return true;
-  // /users/{id}/lists/{list_id}
-  if (parts.length === 4 && parts[2] === 'lists') return true;
-  // /users/{id}/lists/{list_id}/items[...]
-  if (parts.length >= 5 && parts[2] === 'lists' && parts[4] === 'items') return true;
-  return false;
-}
-
-function resolveTraktProxyAuthMode(pathname) {
-  const pathnameLower = pathname.toLowerCase();
-
-  // Auth required routes.
-  if (
-    pathnameLower.startsWith('/calendars/my/') ||
-    pathnameLower.startsWith('/recommendations/') ||
-    pathnameLower.startsWith('/sync/') ||
-    pathnameLower.startsWith('/users/hidden/') ||
-    pathnameLower.includes('/progress/watched')
-  ) {
-    return 'required';
-  }
-
-  // OAuth optional routes we currently proxy.
-  if (pathnameLower.startsWith('/users/') && isOptionalUsersRoute(pathnameLower)) {
-    return 'optional';
-  }
-
-  // Known public/unauthed route groups we currently proxy.
-  if (
-    pathnameLower.startsWith('/genres/') ||
-    pathnameLower.startsWith('/lists/') ||
-    pathnameLower.startsWith('/movies/') ||
-    pathnameLower.startsWith('/shows/') ||
-    pathnameLower.startsWith('/search/') ||
-    pathnameLower.startsWith('/people/')
-  ) {
-    return 'unauthed';
-  }
-
-  // Default to auth-required for unknown routes.
-  return 'required';
-}
 
 // Proxy endpoint for Trakt API calls with auth-aware routing
 addon.post("/api/trakt/proxy", async (req, res) => {
@@ -1277,9 +1529,19 @@ addon.get("/api/mdblist/user", async (req, res) => {
 });
 
 // Proxy: Get user's lists
+const { envInt } = require('./utils/envNumber');
+
+/** Read per call so a dashboard change lands without a restart. */
+function mdblistListCacheTtl() {
+  return envInt('MDBLIST_LIST_CACHE_TTL', 30 * 60, 0);
+}
+
+/** Keyed per key rather than globally: without a username MDBList returns the caller's own lists. */
+/** The instance key stands in when the caller sends none, same as the catalog paths. */
 addon.get("/api/mdblist/lists/user", async (req, res) => {
   try {
-    const { apikey, username, sort } = req.query;
+    const { username, sort } = req.query;
+    const apikey = resolveMdblistKey(req.query.apikey);
     
     if (!apikey) {
       return res.status(400).json({ error: "apikey is required" });
@@ -1293,8 +1555,15 @@ addon.get("/api/mdblist/lists/user", async (req, res) => {
       url += `&sort=${sort}`;
     }
     
-    const response = await makeRateLimitedMDBListRequest(url, apikey, 'MDBList Proxy - Get User Lists');
-    res.json(response.data);
+    const payload = await cacheWrapGlobal(
+      mdblistCacheKey(['lists', 'user', username || '~self', sort || 'default'], apikey),
+      async () => {
+        const response = await makeRateLimitedMDBListRequest(url, apikey, 'MDBList Proxy - Get User Lists');
+        return response.data;
+      },
+      mdblistListCacheTtl()
+    );
+    res.json(payload);
   } catch (error) {
     consola.error("[MDBList Proxy] Error fetching user lists:", error.message);
     const status = error.response?.status || 500;
@@ -1302,10 +1571,47 @@ addon.get("/api/mdblist/lists/user", async (req, res) => {
   }
 });
 
+// Proxy: Search public lists by name, ordered by popularity
+addon.get("/api/mdblist/lists/search", async (req, res) => {
+  try {
+    const query = typeof req.query.query === 'string' ? req.query.query.trim() : '';
+    if (!query) {
+      return res.status(400).json({ error: "query is required" });
+    }
+
+    const apikey = resolveMdblistKey(req.query.apikey);
+    if (!apikey) {
+      return res.status(400).json({ error: "apikey is required" });
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const url = `https://api.mdblist.com/lists/search?apikey=${apikey}&query=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}`;
+
+    const payload = await cacheWrapGlobal(
+      mdblistCacheKey(['lists', 'search', query.toLowerCase(), String(limit), String(offset)], apikey),
+      async () => {
+        const response = await makeRateLimitedMDBListRequest(url, apikey, 'MDBList Proxy - Search Lists');
+        return {
+          results: Array.isArray(response.data) ? response.data : [],
+          hasMore: String(response.headers?.['x-has-more'] ?? '').toLowerCase() === 'true',
+          totalItems: parseInt(response.headers?.['x-total-items'], 10) || 0,
+        };
+      },
+      mdblistListCacheTtl()
+    );
+    res.json(payload);
+  } catch (error) {
+    consola.error("[MDBList Proxy] Error searching lists:", error.message);
+    const status = error.response?.status || 500;
+    res.status(status).json({ error: error.message || "Failed to search lists" });
+  }
+});
+
 // Proxy: Get top lists
 addon.get("/api/mdblist/lists/top", async (req, res) => {
   try {
-    const { apikey } = req.query;
+    const apikey = resolveMdblistKey(req.query.apikey);
     
     if (!apikey) {
       return res.status(400).json({ error: "apikey is required" });
@@ -1321,11 +1627,53 @@ addon.get("/api/mdblist/lists/top", async (req, res) => {
   }
 });
 
+// Proxy: Get a list's items, poster URLs included.
+// Declared above /:username/:listname, which would otherwise swallow this path.
+addon.get("/api/mdblist/lists/:listId/items", async (req, res) => {
+  try {
+    const { listId } = req.params;
+    const { limit } = req.query;
+    const apikey = resolveMdblistKey(req.query.apikey);
+
+    if (!apikey) {
+      return res.status(400).json({ error: "apikey is required" });
+    }
+
+    const params = new URLSearchParams({ apikey, append_to_response: 'poster' });
+    const parsedLimit = Number.parseInt(limit, 10);
+    if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+      params.set('limit', String(Math.min(parsedLimit, 50)));
+    }
+
+    const url = `https://api.mdblist.com/lists/${listId}/items?${params.toString()}`;
+    const items = await cacheWrapGlobal(
+      mdblistCacheKey(['list', String(listId), 'items', params.get('limit') || 'all'], apikey),
+      async () => {
+        const response = await makeRateLimitedMDBListRequest(url, apikey, `MDBList Proxy - Get List Items ${listId}`);
+        const payload = response.data || {};
+        return [...(payload.movies || []), ...(payload.shows || [])].map(item => ({
+          id: item.id,
+          title: item.title,
+          mediatype: item.mediatype,
+          poster: item.poster || null,
+        }));
+      },
+      mdblistListCacheTtl()
+    );
+
+    res.json({ items });
+  } catch (error) {
+    consola.error("[MDBList Proxy] Error fetching list items:", error.message);
+    const status = error.response?.status || 500;
+    res.status(status).json({ error: error.message || "Failed to fetch list items" });
+  }
+});
+
 // Proxy: Get list details by username/listname
 addon.get("/api/mdblist/lists/:username/:listname", async (req, res) => {
   try {
     const { username, listname } = req.params;
-    const { apikey } = req.query;
+    const apikey = resolveMdblistKey(req.query.apikey);
     
     if (!apikey) {
       return res.status(400).json({ error: "apikey is required" });
@@ -1345,7 +1693,7 @@ addon.get("/api/mdblist/lists/:username/:listname", async (req, res) => {
 addon.get("/api/mdblist/lists/:listId", async (req, res) => {
   try {
     const { listId } = req.params;
-    const { apikey } = req.query;
+    const apikey = resolveMdblistKey(req.query.apikey);
     
     if (!apikey) {
       return res.status(400).json({ error: "apikey is required" });
@@ -1367,65 +1715,7 @@ const tvdbApi = require('./lib/tvdb');
 const TMDB_DISCOVER_CACHE_TTL = 24 * 60 * 60; // 24h for mostly static discover reference data
 const TVDB_DISCOVER_CACHE_TTL = 24 * 60 * 60; // 24h for mostly static discover reference data
 
-function normalizeTmdbDiscoverType(type) {
-  return type === 'tv' ? 'tv' : 'movie';
-}
 
-function normalizeTvdbDiscoverType(type) {
-  return type === 'series' ? 'series' : 'movies';
-}
-
-function toTvdbCountryCode(regionCode) {
-  const normalized = typeof regionCode === 'string' ? regionCode.trim().toUpperCase() : '';
-  if (!normalized) return 'usa';
-  const countryData = getCountryISO3(normalized);
-  if (!countryData) return 'usa';
-  return String(countryData).toLowerCase();
-}
-
-async function resolveTmdbDiscoverApiKey(req) {
-  const requestApiKey = typeof req.query.apikey === 'string' ? req.query.apikey.trim() : '';
-  if (requestApiKey) {
-    return requestApiKey;
-  }
-
-  const userUUID = typeof req.query.userUUID === 'string' ? req.query.userUUID.trim() : '';
-  if (userUUID) {
-    try {
-      const userConfig = await loadConfigFromDatabase(userUUID);
-      const userConfigKey = userConfig?.apiKeys?.tmdb?.trim() || '';
-      if (userConfigKey) {
-        return userConfigKey;
-      }
-    } catch (error) {
-      consola.debug(`[TMDB Discover] Could not load config for user ${userUUID}: ${error.message}`);
-    }
-  }
-
-  return (process.env.TMDB_API_KEY || process.env.TMDB_API || process.env.BUILT_IN_TMDB_API_KEY || '').trim();
-}
-
-async function resolveTvdbDiscoverApiKey(req) {
-  const requestApiKey = typeof req.query.apikey === 'string' ? req.query.apikey.trim() : '';
-  if (requestApiKey) {
-    return requestApiKey;
-  }
-
-  const userUUID = typeof req.query.userUUID === 'string' ? req.query.userUUID.trim() : '';
-  if (userUUID) {
-    try {
-      const userConfig = await loadConfigFromDatabase(userUUID);
-      const userConfigKey = userConfig?.apiKeys?.tvdb?.trim() || '';
-      if (userConfigKey) {
-        return userConfigKey;
-      }
-    } catch (error) {
-      consola.debug(`[TVDB Discover] Could not load config for user ${userUUID}: ${error.message}`);
-    }
-  }
-
-  return (process.env.TVDB_API_KEY || process.env.BUILT_IN_TVDB_API_KEY || '').trim();
-}
 
 // Proxy: Get TMDB list details
 addon.get("/api/tmdb/list/:listId", async (req, res) => {
@@ -1584,6 +1874,13 @@ addon.get("/api/tmdb/discover/search/:entity", async (req, res) => {
       return res.status(400).json({ error: "query is required" });
     }
 
+    // TMDB has no /search/network endpoint; resolve from the daily export index instead
+    if (entity === 'network') {
+      const { searchTmdbNetworks } = require('./lib/tmdb-network-index');
+      const networks = await searchTmdbNetworks(String(query).trim(), 25);
+      return res.json({ entity, results: networks.map(n => ({ id: n.id, name: n.label })) });
+    }
+
     const endpointMap = {
       person: '/search/person',
       company: '/search/company',
@@ -1592,7 +1889,7 @@ addon.get("/api/tmdb/discover/search/:entity", async (req, res) => {
 
     const endpoint = endpointMap[entity];
     if (!endpoint) {
-      return res.status(400).json({ error: "entity must be one of: person, company, keyword" });
+      return res.status(400).json({ error: "entity must be one of: person, company, keyword, network" });
     }
 
     const config = { apiKeys: { tmdb: tmdbApiKey } };
@@ -1902,14 +2199,224 @@ addon.get("/api/tvdb/discover/search/:entity", async (req, res) => {
   }
 });
 
+
+async function buildTvdbListConfig(req, res) {
+  const tvdbApiKey = await resolveTvdbDiscoverApiKey(req);
+  if (!tvdbApiKey) {
+    res.status(400).json({ error: "TVDB API key is required (config.apiKeys.tvdb, TVDB_API_KEY, or BUILT_IN_TVDB_API_KEY)" });
+    return null;
+  }
+  const userUUID = typeof req.query.userUUID === 'string' && req.query.userUUID.trim()
+    ? req.query.userUUID.trim()
+    : undefined;
+  return { apiKeys: { tvdb: tvdbApiKey }, ...(userUUID ? { userUUID } : {}) };
+}
+
+// Proxy: browse TheTVDB lists, one page at a time
+addon.get("/api/tvdb/lists", async (req, res) => {
+  try {
+    const tvdbConfig = await buildTvdbListConfig(req, res);
+    if (!tvdbConfig) return;
+
+    const page = Math.max(0, parseInt(req.query.page, 10) || 0);
+    const results = await cacheWrapGlobal(
+      `tvdb:lists:browse:v2:${page}`,
+      async () => {
+        const records = await tvdbApi.getCollectionsList(tvdbConfig, page);
+        const normalized = (Array.isArray(records) ? records : []).map(normalizeTvdbListRecord).filter(Boolean);
+        return enrichTvdbListRecords(normalized, tvdbConfig);
+      },
+      6 * 60 * 60
+    );
+
+    return res.json({ page, results });
+  } catch (error) {
+    consola.error("[TVDB Lists] Error browsing lists:", error.message);
+    const status = error.response?.status || 500;
+    return res.status(status).json({ error: error.message || "Failed to browse TVDB lists" });
+  }
+});
+
+// Proxy: search TheTVDB lists by name
+addon.get("/api/tvdb/lists/search", async (req, res) => {
+  try {
+    const query = typeof req.query.query === 'string' ? req.query.query.trim() : '';
+    if (!query) {
+      return res.status(400).json({ error: "query is required" });
+    }
+
+    const tvdbConfig = await buildTvdbListConfig(req, res);
+    if (!tvdbConfig) return;
+
+    const results = await cacheWrapGlobal(
+      `tvdb:lists:search:v3:${query.toLowerCase()}`,
+      async () => {
+        const records = await tvdbApi.searchCollections(query, tvdbConfig);
+        const normalized = (Array.isArray(records) ? records : []).map(normalizeTvdbListRecord).filter(Boolean).slice(0, 40);
+        const enriched = await enrichTvdbListRecords(normalized, tvdbConfig);
+        // thetvdb.com only surfaces official lists, so match that ranking rather
+        // than the search index order, which buries them among unpublished ones.
+        return enriched.sort((a, b) =>
+          (Number(b.isOfficial) - Number(a.isOfficial)) || (b.itemCount - a.itemCount)
+        );
+      },
+      60 * 60
+    );
+
+    return res.json({ query, results });
+  } catch (error) {
+    consola.error("[TVDB Lists] Error searching lists:", error.message);
+    const status = error.response?.status || 500;
+    return res.status(status).json({ error: error.message || "Failed to search TVDB lists" });
+  }
+});
+
+// Proxy: resolve a list id, slug or thetvdb.com URL into a previewable record
+addon.get("/api/tvdb/lists/resolve", async (req, res) => {
+  try {
+    const raw = typeof req.query.input === 'string' ? req.query.input.trim() : '';
+    if (!raw) {
+      return res.status(400).json({ error: "input is required" });
+    }
+
+    const tvdbConfig = await buildTvdbListConfig(req, res);
+    if (!tvdbConfig) return;
+
+    const urlMatch = raw.match(/thetvdb\.com\/lists\/([^/?#]+)/i);
+    const candidate = urlMatch ? decodeURIComponent(urlMatch[1]) : raw;
+
+    const preview = await cacheWrapGlobal(
+      `tvdb:lists:resolve:v3:${candidate.toLowerCase()}`,
+      async () => {
+        // A slug can be all digits and still not be an id: list 1 has the slug "1001".
+        const base = await tvdbApi.getCollectionBySlug(candidate, tvdbConfig);
+        const listId = base?.id
+          ? String(base.id)
+          : (/^\d+$/.test(candidate) ? candidate : null);
+        if (!listId) return null;
+
+        const details = await tvdbApi.getCollectionDetails(listId, tvdbConfig);
+        if (!details?.id) return null;
+
+        const entities = Array.isArray(details.entities) ? details.entities : [];
+        const movieCount = entities.filter(e => e?.movieId).length;
+        const seriesCount = entities.filter(e => e?.seriesId).length;
+
+        return {
+          ...normalizeTvdbListRecord({ ...base, ...details }),
+          movieCount,
+          seriesCount,
+          itemCount: movieCount + seriesCount
+        };
+      },
+      6 * 60 * 60
+    );
+
+    if (!preview) {
+      return res.status(404).json({ error: "No TheTVDB list matched that id or slug" });
+    }
+
+    return res.json(preview);
+  } catch (error) {
+    consola.error("[TVDB Lists] Error resolving list:", error.message);
+    const status = error.response?.status || 500;
+    return res.status(status).json({ error: error.message || "Failed to resolve TVDB list" });
+  }
+});
+
+function normalizeTmdbCollection(record) {
+  const id = Number(record?.id);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return {
+    id,
+    name: record?.name || `Collection ${id}`,
+    overview: record?.overview || '',
+    poster: record?.poster_path ? `https://image.tmdb.org/t/p/w342${record.poster_path}` : '',
+    backdrop: record?.backdrop_path ? `https://image.tmdb.org/t/p/w780${record.backdrop_path}` : '',
+    url: `https://www.themoviedb.org/collection/${id}`
+  };
+}
+
+// Proxy: search TMDB collections by name
+addon.get("/api/tmdb/collections/search", async (req, res) => {
+  try {
+    const query = typeof req.query.query === 'string' ? req.query.query.trim() : '';
+    if (!query) {
+      return res.status(400).json({ error: "query is required" });
+    }
+    const apikey = await resolveTmdbDiscoverApiKey(req);
+    if (!apikey) {
+      return res.status(400).json({ error: "TMDB API key is required" });
+    }
+
+    const language = typeof req.query.language === 'string' && req.query.language.trim()
+      ? req.query.language.trim()
+      : 'en-US';
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+
+    const data = await moviedb.searchCollection({ query, page, language }, { apiKeys: { tmdb: apikey } });
+    const results = (data?.results || []).map(normalizeTmdbCollection).filter(Boolean);
+
+    return res.json({ query, page, totalPages: data?.total_pages || 1, totalResults: data?.total_results || 0, results });
+  } catch (error) {
+    consola.error("[TMDB Collections] Error searching:", error.message);
+    const status = error.response?.status || 500;
+    return res.status(status).json({ error: error.message || "Failed to search TMDB collections" });
+  }
+});
+
+// Proxy: resolve a collection id or themoviedb.org/collection URL into a previewable record
+addon.get("/api/tmdb/collections/resolve", async (req, res) => {
+  try {
+    const raw = typeof req.query.input === 'string' ? req.query.input.trim() : '';
+    if (!raw) {
+      return res.status(400).json({ error: "input is required" });
+    }
+    const apikey = await resolveTmdbDiscoverApiKey(req);
+    if (!apikey) {
+      return res.status(400).json({ error: "TMDB API key is required" });
+    }
+
+    const urlMatch = raw.match(/themoviedb\.org\/collection\/(\d+)/i);
+    const collectionId = urlMatch ? urlMatch[1] : (/^\d+/.test(raw) ? raw.match(/^\d+/)[0] : null);
+    if (!collectionId) {
+      return res.status(400).json({ error: "Enter a collection id or a themoviedb.org/collection link" });
+    }
+
+    const language = typeof req.query.language === 'string' && req.query.language.trim()
+      ? req.query.language.trim()
+      : 'en-US';
+
+    const collection = await moviedb.collectionInfo({ id: collectionId, language }, { apiKeys: { tmdb: apikey } });
+    if (!collection?.id) {
+      return res.status(404).json({ error: "No TMDB collection matched that id" });
+    }
+
+    const parts = Array.isArray(collection.parts) ? collection.parts : [];
+    const dated = parts.filter(p => p?.release_date).map(p => p.release_date).sort();
+
+    return res.json({
+      ...normalizeTmdbCollection(collection),
+      itemCount: parts.length,
+      undatedCount: parts.length - dated.length,
+      firstRelease: dated[0] || null,
+      lastRelease: dated[dated.length - 1] || null
+    });
+  } catch (error) {
+    consola.error("[TMDB Collections] Error resolving:", error.message);
+    const status = error.response?.status || 500;
+    return res.status(status).json({ error: error.message || "Failed to resolve TMDB collection" });
+  }
+});
+
 // AI-powered catalog creation
 const aiCatalogRateLimit = new Map();
 addon.post("/api/ai/create-catalog", async (req, res) => {
   try {
-    const { userUUID, password, query, provider, generationMode, geminiKey: clientGeminiKey, openrouterKey: clientOpenrouterKey } = req.body;
+    const { userUUID, password, query, provider, generationMode, model: requestedModel, geminiKey: clientGeminiKey, openrouterKey: clientOpenrouterKey } = req.body;
 
-    if (!userUUID || !password) {
-      return res.status(400).json({ error: 'User UUID and password are required' });
+    if (!userUUID) {
+      return res.status(400).json({ error: 'User UUID is required' });
     }
     if (!query || typeof query !== 'string' || !query.trim()) {
       return res.status(400).json({ error: 'Query is required' });
@@ -1931,13 +2438,14 @@ addon.post("/api/ai/create-catalog", async (req, res) => {
     aiCatalogRateLimit.set(userRateKey, recentRequests);
 
     // Authenticate
-    const config = await database.verifyUserAndGetConfig(userUUID, password);
-    if (!config) {
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access) {
       return res.status(401).json({ error: 'Invalid UUID or password' });
     }
+    const config = access.config;
 
     const openrouterKey = config.apiKeys?.openrouter || clientOpenrouterKey;
-    const geminiKey = config.apiKeys?.gemini || clientGeminiKey;
+    const geminiKey = config.apiKeys?.gemini || clientGeminiKey || process.env.BUILT_IN_GEMINI_API_KEY;
     if (!openrouterKey && !geminiKey) {
       return res.status(400).json({ error: 'No AI API key configured. Add an OpenRouter or Gemini key in your settings.' });
     }
@@ -1959,10 +2467,12 @@ addon.post("/api/ai/create-catalog", async (req, res) => {
 
     let rawText = null;
     const useOpenRouter = provider === 'gemini' ? (!geminiKey && !!openrouterKey) : !!openrouterKey;
+    const { resolveCatalogModel } = require('./utils/ai-model-resolver');
+    const activeProvider = useOpenRouter ? 'openrouter' : 'gemini';
+    const model = resolveCatalogModel({ config, provider: activeProvider, requestedModel });
 
     if (useOpenRouter) {
       const { generateContent } = require('./utils/openrouter-client');
-      const model = config.search?.ai_model || 'google/gemini-2.5-flash';
       const result = await generateContent({
         apiKey: openrouterKey,
         model,
@@ -1973,7 +2483,6 @@ addon.post("/api/ai/create-catalog", async (req, res) => {
       rawText = result.text;
     } else {
       const { generateContent } = require('./utils/gemini-client');
-      const model = config.search?.ai_model || 'gemini-2.5-flash';
       const result = await generateContent({
         apiKey: geminiKey,
         model,
@@ -2344,7 +2853,7 @@ addon.get("/api/mal/discover/preview", async (req, res) => {
 addon.get("/api/mdblist/discover/preview", async (req, res) => {
   try {
     const params = { ...req.query };
-    const apiKey = params.apikey || process.env.MDBLIST_API_KEY || '';
+    const apiKey = params.apikey || process.env.MDBLIST_API_KEY || process.env.BUILT_IN_MDBLIST_API_KEY || '';
     const mediaType = params.mediaType === 'show' ? 'show' : 'movie';
     delete params.apikey;
     delete params.userUUID;
@@ -2583,14 +3092,22 @@ addon.post("/api/flixpatrol/probe", async (req, res) => {
   }
 });
 
+// GET /api/flixpatrol/availability - Precomputed map of valid (service, country)
+// combos so the config UI can filter its dropdowns without probing each pair.
+// Returns { available: false } when the feed does not publish the index.
+addon.get("/api/flixpatrol/availability", (req, res) => {
+  try {
+    const { getFlixPatrolAvailability } = require('./utils/flixpatrolUtils');
+    const index = getFlixPatrolAvailability();
+    res.json({ available: Boolean(index), index: index || null });
+  } catch (error) {
+    consola.error("[FlixPatrol] Availability error:", error.message);
+    res.json({ available: false, index: null });
+  }
+});
+
 // --- AniList OAuth Routes ---
 const anilistTracker = require('./lib/anilistTracker');
-const noStoreOAuthHeaders = (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  next();
-};
 addon.use(['/anilist/auth', '/anilist/callback'], noStoreOAuthHeaders);
 
 // GET /anilist/auth - Initiate AniList OAuth flow
@@ -2606,11 +3123,7 @@ addon.get("/anilist/auth", async (req, res) => {
       return res.status(500).json({ error: "AniList OAuth not configured. Please set ANILIST_CLIENT_ID and ANILIST_CLIENT_SECRET environment variables." });
     }
     
-    // Generate state parameter for CSRF protection
-    const state = crypto.randomBytes(32).toString('hex');
-    
-    // Store state in a short-lived way (we'll validate it in callback)
-    // For simplicity, we encode it in the URL - in production you might use a session store
+    const state = createAniListOAuthState(clientSecret, ANILIST_OAUTH_STATE_TTL_MS);
     const authUrl = anilistTracker.getAuthorizationUrl(redirectUri, state);
     
     res.redirect(authUrl);
@@ -2623,82 +3136,81 @@ addon.get("/anilist/auth", async (req, res) => {
 // GET /anilist/callback - Handle AniList OAuth callback
 addon.get("/anilist/callback", async (req, res) => {
   try {
-    const { code } = req.query;
+    const codeParam = Array.isArray(req.query.code) ? req.query.code[0] : req.query.code;
+    const stateParam = Array.isArray(req.query.state) ? req.query.state[0] : req.query.state;
+    const code = typeof codeParam === 'string' ? codeParam : '';
+    const state = typeof stateParam === 'string' ? stateParam : '';
     
     if (!code) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>AniList OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ OAuth Error</h1>
-          <p>Invalid callback parameters - missing authorization code.</p>
-        </body>
-        </html>
-      `);
+      return res.status(400).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'error',
+        title: 'Authorization incomplete',
+        message: 'AniList did not return an authorization code. Please start the connection again.',
+        retryHref: '/anilist/auth',
+      }));
     }
-    if (usedAnilistCodes.has(code)) {
-      return res.status(400).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Anilist OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>⚠️ Code Already Used</h1>
-          <p>This authorization code has already been exchanged. Please try authenticating again.</p>
-        </body>
-        </html>
-      `);
-    }
-    usedAnilistCodes.add(code);
-    setTimeout(() => usedAnilistCodes.delete(code), 120000);
     
     const clientId = process.env.ANILIST_CLIENT_ID;
     const clientSecret = process.env.ANILIST_CLIENT_SECRET;
     const redirectUri = normalizeRedirectUri(process.env.ANILIST_REDIRECT_URI || `${process.env.HOST_NAME}/anilist/callback`);
     
     if (!clientId || !clientSecret) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>AniList OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>⚠️ Configuration Error</h1>
-          <p>AniList OAuth is not configured on this server.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'warning',
+        title: 'AniList is not configured',
+        message: 'This server is missing the credentials required to connect an AniList account.',
+      }));
     }
+
+    if (!verifyAniListOAuthState(state, clientSecret)) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'error',
+        title: 'Connection expired',
+        message: 'The secure authorization state is missing, invalid, or expired. Please start again.',
+        retryHref: '/anilist/auth',
+      }));
+    }
+
+    if (usedAnilistCodes.has(code)) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'warning',
+        title: 'Authorization already used',
+        message: 'This authorization has already been completed. Start a new connection if you need another token.',
+        retryHref: '/anilist/auth',
+        retryLabel: 'Reconnect AniList',
+      }));
+    }
+    usedAnilistCodes.add(code);
+    setTimeout(() => usedAnilistCodes.delete(code), 120000);
     
     // Exchange code for tokens
     const tokens = await anilistTracker.exchangeCodeForTokens(code, redirectUri);
     
     if (!tokens) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>AniList OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ Token Exchange Failed</h1>
-          <p>Failed to exchange authorization code for tokens.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'error',
+        title: 'Connection failed',
+        message: 'The authorization code could not be exchanged for an AniList token. Please try again.',
+        retryHref: '/anilist/auth',
+      }));
     }
     
     // Get user info from AniList
     const user = await anilistTracker.getAuthenticatedUser(tokens.access_token);
     
     if (!user) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>AniList OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ User Info Error</h1>
-          <p>Failed to retrieve AniList user information.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'error',
+        title: 'Profile unavailable',
+        message: 'AniList authorized the connection, but the account profile could not be loaded. Please try again.',
+        retryHref: '/anilist/auth',
+      }));
     }
     
     const existingTokens = await database.getOAuthTokensByProvider('anilist');
@@ -2729,86 +3241,32 @@ addon.get("/anilist/callback", async (req, res) => {
     }
     
     if (!saved) {
-      return res.status(500).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>AniList OAuth Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1>❌ Database Error</h1>
-          <p>Failed to save OAuth token to database.</p>
-        </body>
-        </html>
-      `);
+      return res.status(500).send(renderOAuthPage({
+        provider: 'anilist',
+        status: 'error',
+        title: 'Token could not be saved',
+        message: 'AniList authorized the connection, but this server could not store the token. Please try again.',
+        retryHref: '/anilist/auth',
+      }));
     }
-    
-    // Display success page with token ID
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>AniList OAuth Success</title>
-        <style>
-          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
-          .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          h1 { color: #02a9ff; }
-          .token-box { background: #f9f9f9; border: 2px dashed #02a9ff; padding: 20px; margin: 20px 0; border-radius: 5px; word-break: break-all; }
-          .token { font-family: monospace; font-size: 14px; color: #333; }
-          button { background: #02a9ff; color: white; border: none; padding: 12px 30px; font-size: 16px; cursor: pointer; border-radius: 5px; margin: 10px; }
-          button:hover { background: #0288d1; }
-          .instructions { text-align: left; margin-top: 30px; padding: 20px; background: #f0f8ff; border-left: 4px solid #02a9ff; }
-          .instructions ol { padding-left: 20px; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>✅ AniList OAuth Successful</h1>
-          <p>Your AniList account <strong>${user.username}</strong> has been authorized!</p>
-          
-          <div class="token-box">
-            <div class="token" id="tokenId">${tokenId}</div>
-          </div>
-          
-          <button onclick="copyToken()">📋 Copy Token ID</button>
-          
-          <div class="instructions">
-            <h3>📝 Next Steps:</h3>
-            <ol>
-              <li>Copy the Token ID above</li>
-              <li>Go to your addon configuration page</li>
-              <li>Find the <strong>AniList Integration</strong> section</li>
-              <li>Paste this Token ID in the <strong>AniList Token ID</strong> field</li>
-              <li>Save your configuration</li>
-            </ol>
-            <p><strong>⚠️ Important:</strong> Keep this Token ID private. Anyone with this ID can access your AniList account through this addon.</p>
-          </div>
-        </div>
-        
-        <script>
-          function copyToken() {
-            const tokenText = document.getElementById('tokenId').textContent;
-            navigator.clipboard.writeText(tokenText).then(() => {
-              alert('✅ Token ID copied to clipboard!');
-            }).catch(err => {
-              alert('❌ Failed to copy. Please select and copy manually.');
-            });
-          }
-        </script>
-      </body>
-      </html>
-    `);
+
+    res.send(renderOAuthPage({
+      provider: 'anilist',
+      status: 'success',
+      title: 'AniList connected',
+      message: 'Authorization is complete. Copy the token ID and paste it into the AniList integration settings.',
+      username: user.username,
+      tokenId,
+    }));
   } catch (error) {
     consola.error("[AniList OAuth] Callback error:", error);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-      <head><title>AniList OAuth Error</title></head>
-      <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-        <h1>❌ OAuth Error</h1>
-        <p>An error occurred during authentication: ${error.message}</p>
-        <p><a href="${process.env.HOST_NAME}/configure">← Back to Configuration</a></p>
-      </body>
-      </html>
-    `);
+    res.status(500).send(renderOAuthPage({
+      provider: 'anilist',
+      status: 'error',
+      title: 'Something went wrong',
+      message: 'An unexpected error interrupted the AniList connection. Please try again.',
+      retryHref: '/anilist/auth',
+    }));
   }
 });
 
@@ -2849,15 +3307,17 @@ addon.post("/anilist/disconnect", async (req, res) => {
     // Invalidate config cache
     configCache.del(userUUID);
     
-    res.json({ success: true });
+    // `removed` says exactly what this disconnect took out, so a page holding
+    // unsaved edits can apply the same removals instead of adopting the whole
+    // saved document and losing them.
+    res.json({ success: true, config, removed: { apiKeys: ['anilistTokenId'], fields: ['anilistWatchTracking'] } });
   } catch (error) {
     consola.error("[AniList] Disconnect error:", error);
     res.status(500).json({ error: "Failed to disconnect AniList" });
   }
 });
 
-// GET /anilist/status/:userUUID - Get AniList connection status
-addon.get("/anilist/status/:userUUID", async (req, res) => {
+addon.get("/anilist/status/:userUUID", requireDashboardAdmin, async (req, res) => {
   try {
     const { userUUID } = req.params;
     
@@ -2902,6 +3362,252 @@ addon.get("/anilist/status/:userUUID", async (req, res) => {
   } catch (error) {
     consola.error("[AniList] Status check error:", error);
     res.status(500).json({ error: "Failed to check AniList status" });
+  }
+});
+
+const malTracker = require('./lib/malTracker');
+
+addon.use(['/mal/auth', '/mal/callback'], noStoreOAuthHeaders);
+
+// GET /mal/auth - Initiate MyAnimeList OAuth flow
+addon.get("/mal/auth", async (req, res) => {
+  try {
+    const clientId = process.env.MAL_CLIENT_ID;
+    const clientSecret = process.env.MAL_CLIENT_SECRET;
+    const redirectUri = normalizeRedirectUri(process.env.MAL_REDIRECT_URI || `${process.env.HOST_NAME}/mal/callback`);
+
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({ error: "MyAnimeList OAuth not configured. Please set MAL_CLIENT_ID and MAL_CLIENT_SECRET environment variables." });
+    }
+
+    consola.info(`[MAL OAuth] Starting auth flow with redirect_uri=${redirectUri}`);
+
+    const { state, codeVerifier } = createMalOAuthTransaction(
+      clientSecret,
+      MAL_OAUTH_STATE_TTL_MS
+    );
+
+    const authUrl = malTracker.getAuthorizationUrl(redirectUri, state, codeVerifier);
+    res.redirect(authUrl);
+  } catch (error) {
+    consola.error("[MAL OAuth] Authorization error:", error);
+    res.status(500).json({ error: "Failed to initiate MyAnimeList authorization" });
+  }
+});
+
+// GET /mal/callback - Handle MyAnimeList OAuth callback
+addon.get("/mal/callback", async (req, res) => {
+  try {
+    const { code, state } = req.query;
+
+    if (!code) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'error',
+        title: 'Authorization incomplete',
+        message: 'MyAnimeList did not return an authorization code. Please start the connection again.',
+        retryHref: '/mal/auth',
+      }));
+    }
+
+    const clientSecret = process.env.MAL_CLIENT_SECRET;
+    const codeVerifier = state
+      ? verifyMalOAuthState(state, clientSecret)
+      : null;
+    if (!codeVerifier) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'error',
+        title: 'Connection expired',
+        message: 'The secure authorization state is missing, invalid, or expired. Please start again.',
+        retryHref: '/mal/auth',
+      }));
+    }
+
+    if (usedMalCodes.has(code)) {
+      return res.status(400).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'warning',
+        title: 'Authorization already used',
+        message: 'This authorization has already been completed. Start a new connection if you need another token.',
+        retryHref: '/mal/auth',
+        retryLabel: 'Reconnect MyAnimeList',
+      }));
+    }
+    usedMalCodes.add(code);
+    setTimeout(() => usedMalCodes.delete(code), 120000);
+
+    const clientId = process.env.MAL_CLIENT_ID;
+    const redirectUri = normalizeRedirectUri(process.env.MAL_REDIRECT_URI || `${process.env.HOST_NAME}/mal/callback`);
+
+    if (!clientId || !clientSecret) {
+      return res.status(500).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'warning',
+        title: 'MyAnimeList is not configured',
+        message: 'This server is missing the credentials required to connect a MyAnimeList account.',
+      }));
+    }
+
+    const tokens = await malTracker.exchangeCodeForTokens(code, redirectUri, codeVerifier);
+    if (!tokens) {
+      return res.status(500).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'error',
+        title: 'Connection failed',
+        message: 'The authorization code could not be exchanged for a MyAnimeList token. Please try again.',
+        retryHref: '/mal/auth',
+      }));
+    }
+
+    const user = await malTracker.getAuthenticatedUser(tokens.access_token);
+    if (!user) {
+      return res.status(500).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'error',
+        title: 'Profile unavailable',
+        message: 'MyAnimeList authorized the connection, but the account profile could not be loaded. Please try again.',
+        retryHref: '/mal/auth',
+      }));
+    }
+
+    const existingTokens = await database.getOAuthTokensByProvider('mal');
+    const existingToken = existingTokens.find(t => t.user_id.toLowerCase() === user.username.toLowerCase());
+    let tokenId;
+    let saved;
+    if (existingToken) {
+      tokenId = existingToken.id;
+      consola.info(`[MAL OAuth] Updating existing token - tokenId: ${tokenId}, user: ${user.username}`);
+      saved = await database.updateOAuthToken(
+        tokenId,
+        tokens.access_token,
+        tokens.refresh_token || '',
+        tokens.expires_at
+      );
+    } else {
+      tokenId = crypto.randomUUID();
+      consola.info(`[MAL OAuth] Creating new token - tokenId: ${tokenId}, user: ${user.username}`);
+      saved = await database.saveOAuthToken(
+        tokenId,
+        'mal',
+        user.username,
+        tokens.access_token,
+        tokens.refresh_token || '',
+        tokens.expires_at,
+        ''
+      );
+    }
+
+    if (!saved) {
+      return res.status(500).send(renderOAuthPage({
+        provider: 'mal',
+        status: 'error',
+        title: 'Token could not be saved',
+        message: 'MyAnimeList authorized the connection, but this server could not store the token. Please try again.',
+        retryHref: '/mal/auth',
+      }));
+    }
+
+    res.send(renderOAuthPage({
+      provider: 'mal',
+      status: 'success',
+      title: 'MyAnimeList connected',
+      message: 'Authorization is complete. Copy the token ID and paste it into the MyAnimeList integration settings.',
+      username: user.username,
+      tokenId,
+    }));
+  } catch (error) {
+    consola.error("[MAL OAuth] Callback error:", error);
+    res.status(500).send(renderOAuthPage({
+      provider: 'mal',
+      status: 'error',
+      title: 'Something went wrong',
+      message: 'An unexpected error interrupted the MyAnimeList connection. Please try again.',
+      retryHref: '/mal/auth',
+    }));
+  }
+});
+
+// POST /mal/disconnect - Disconnect MyAnimeList account
+addon.post("/mal/disconnect", async (req, res) => {
+  try {
+    const { userUUID } = req.body;
+
+    if (!userUUID) {
+      return res.status(400).json({ error: "userUUID is required" });
+    }
+
+    const config = await loadConfigFromDatabase(userUUID);
+    if (!config) {
+      return res.status(404).json({ error: "User config not found" });
+    }
+
+    if (config.apiKeys?.malTokenId) {
+      await database.deleteOAuthToken(config.apiKeys.malTokenId);
+      delete config.apiKeys.malTokenId;
+    }
+
+    delete config.malWatchTracking;
+
+    const user = await database.getUser(userUUID);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    await database.saveUserConfig(userUUID, user.password_hash, config);
+    configCache.del(userUUID);
+
+    // `removed` says exactly what this disconnect took out, so a page holding
+    // unsaved edits can apply the same removals instead of adopting the whole
+    // saved document and losing them.
+    res.json({ success: true, config, removed: { apiKeys: ['malTokenId'], fields: ['malWatchTracking'] } });
+  } catch (error) {
+    consola.error("[MAL] Disconnect error:", error);
+    res.status(500).json({ error: "Failed to disconnect MyAnimeList" });
+  }
+});
+
+addon.get("/mal/status/:userUUID", requireDashboardAdmin, async (req, res) => {
+  try {
+    const { userUUID } = req.params;
+
+    if (!userUUID) {
+      return res.status(400).json({ error: "userUUID is required" });
+    }
+
+    const config = await loadConfigFromDatabase(userUUID);
+    if (!config) {
+      return res.status(404).json({ error: "User config not found" });
+    }
+
+    const malTokenId = config.apiKeys?.malTokenId;
+    if (!malTokenId) {
+      return res.json({
+        connected: false,
+        username: null
+      });
+    }
+
+    const token = await database.getOAuthToken(malTokenId);
+    if (!token) {
+      return res.json({
+        connected: false,
+        username: null
+      });
+    }
+
+    const hasRefreshToken = !!token.refresh_token;
+    const isExpired = token.expires_at && Date.now() >= token.expires_at && !hasRefreshToken;
+    res.json({
+      connected: !isExpired,
+      expired: isExpired,
+      expiresAt: token.expires_at || null,
+      username: token.user_id,
+      trackingEnabled: config.malWatchTracking !== false
+    });
+  } catch (error) {
+    consola.error("[MAL] Status check error:", error);
+    res.status(500).json({ error: "Failed to check MyAnimeList status" });
   }
 });
 
@@ -3032,6 +3738,322 @@ addon.get("/api/publicmetadb/picks", async (req, res) => {
   }
 });
 
+// POST /api/integrations/credential - Point a configuration at a credential the OAuth
+// callback already stored. Persisting here rather than waiting for Save is what stops a
+// connection being lost by navigating away, and stops the token row being stranded with
+// nothing referencing it. Only the pointer is written, so unsaved edits held in the page
+// are neither read nor overwritten.
+const INTEGRATION_CREDENTIAL_FIELDS = {
+  trakt: { field: 'traktTokenId', provider: 'trakt' },
+  simkl: { field: 'simklTokenId', provider: 'simkl' },
+  anilist: { field: 'anilistTokenId', provider: 'anilist' },
+  mal: { field: 'malTokenId', provider: 'mal' },
+  movielens: { field: 'movieLensCredId', provider: 'movielens' },
+};
+
+addon.post("/api/integrations/credential", async (req, res) => {
+  try {
+    const { userUUID, password, provider, tokenId } = req.body || {};
+    const mapping = INTEGRATION_CREDENTIAL_FIELDS[provider];
+    if (!userUUID || !mapping || !tokenId) {
+      return res.status(400).json({ error: "userUUID, a known provider and tokenId are required" });
+    }
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access || !access.passwordHash) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    // A typo used to be stored and only fail much later, on the first call that needed it.
+    const row = await database.getOAuthToken(tokenId);
+    if (!row || row.provider !== mapping.provider) {
+      return res.status(404).json({ error: `No ${provider} credential with that id` });
+    }
+    const config = access.config;
+    config.apiKeys = { ...(config.apiKeys || {}), [mapping.field]: tokenId };
+    await database.saveUserConfig(userUUID, access.passwordHash, config);
+    configCache.del(userUUID);
+    res.json({ success: true, field: mapping.field, tokenId });
+  } catch (error) {
+    consola.error(`[Integrations] Failed to store credential: ${error.message}`);
+    res.status(500).json({ error: "Failed to store the credential" });
+  }
+});
+
+// --- Addon manager accounts (AIOManager and friends) ---------------------------
+
+// Relays one Hydra reinstall. Shared by the single-account route and the batch below
+// so both apply the same manifest-origin guard and read upstream errors the same way.
+async function hydraReinstall(instanceUrl: string, apiKey: string, addonUrl: string) {
+  const { httpPost } = require('./utils/httpClient');
+  const target = `${managerAccounts.normalizeInstanceUrl(instanceUrl)}/hydra/reinstall`;
+  try {
+    const response = await httpPost(target, { addonUrl }, {
+      headers: { 'X-API-Key': apiKey },
+      timeout: 15000
+    });
+    if (typeof response.data === 'string') {
+      consola.warn(`[AIOManager Proxy] Non-JSON response from ${target} (status ${response.status}); this instance does not expose the Hydra API, reinstall was not processed`);
+      return { ok: false, status: 502, error: "Your AIOManager instance does not support the Hydra API yet (it requires a newer AIOManager release), so the sync was not processed" };
+    }
+    return { ok: true, status: 200, data: response.data ?? { success: true } };
+  } catch (error: any) {
+    const upstreamStatus = error.response?.status;
+    let upstreamData = error.response?.data;
+    if (typeof upstreamData === 'string') {
+      try { upstreamData = JSON.parse(upstreamData); } catch { upstreamData = null; }
+    }
+    consola.error(`[AIOManager Proxy] Hydra reinstall failed: ${error.message}`);
+    return {
+      ok: false,
+      status: upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : 502,
+      error: upstreamData?.error || upstreamData?.message || error.message || "Hydra reinstall failed"
+    };
+  }
+}
+
+/** A manifest may only be pushed to a manager if this instance is the one serving it. */
+function servedByThisInstance(addonUrl: string): boolean {
+  const hostName = (process.env.HOST_NAME || '').replace(/\/+$/, '');
+  if (!hostName) return true;
+  try {
+    const expected = new URL(hostName.includes('://') ? hostName : `https://${hostName}`).host.toLowerCase();
+    return new URL(String(addonUrl)).host.toLowerCase() === expected;
+  } catch {
+    return false;
+  }
+}
+
+// POST /api/managers/accounts - Add or edit one manager account. The API key is stored
+// out of line and only its id is written to the config.
+addon.post("/api/managers/accounts", async (req, res) => {
+  try {
+    const { userUUID, password, accountId, managerId, label, instanceUrl, apiKey, profileTags, autoSync } = req.body || {};
+    if (!userUUID || !managerId || !instanceUrl) {
+      return res.status(400).json({ error: "userUUID, managerId and instanceUrl are required" });
+    }
+    const normalized = managerAccounts.normalizeInstanceUrl(instanceUrl);
+    if (!managerAccounts.isHttpUrl(normalized)) {
+      return res.status(400).json({ error: "instanceUrl must be a http(s) URL" });
+    }
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access || !access.passwordHash) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const config = access.config;
+    await managerAccounts.migrateLegacyManagers(config, userUUID);
+    if (!accountId && !apiKey) {
+      return res.status(400).json({ error: "apiKey is required for a new account" });
+    }
+    const account = await managerAccounts.upsertAccount(config, userUUID, {
+      accountId, managerId, label, instanceUrl: normalized, apiKey, profileTags, autoSync
+    });
+    await database.saveUserConfig(userUUID, access.passwordHash, config);
+    res.json({ success: true, account, managerAccounts: config.managerAccounts });
+  } catch (error) {
+    consola.error(`[Managers] Failed to save account: ${error.message}`);
+    res.status(500).json({ error: "Failed to save the manager account" });
+  }
+});
+
+// DELETE /api/managers/accounts - Remove one account and the key it points at
+addon.delete("/api/managers/accounts", async (req, res) => {
+  try {
+    const { userUUID, password, accountId } = req.body || {};
+    if (!userUUID || !accountId) {
+      return res.status(400).json({ error: "userUUID and accountId are required" });
+    }
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access || !access.passwordHash) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const config = access.config;
+    await managerAccounts.migrateLegacyManagers(config, userUUID);
+    const removed = await managerAccounts.removeAccount(config, accountId);
+    if (!removed) {
+      return res.status(404).json({ error: "No such account" });
+    }
+    await database.saveUserConfig(userUUID, access.passwordHash, config);
+    res.json({ success: true, managerAccounts: config.managerAccounts });
+  } catch (error) {
+    consola.error(`[Managers] Failed to remove account: ${error.message}`);
+    res.status(500).json({ error: "Failed to remove the manager account" });
+  }
+});
+
+// POST /api/managers/credentials - Legacy single-account save, kept so a cached page
+// still works. Writes through to the account list rather than the old inline shape.
+addon.post("/api/managers/credentials", async (req, res) => {
+  try {
+    const { userUUID, password, managerId, instanceUrl, apiKey } = req.body || {};
+    if (!userUUID || !managerId || !instanceUrl || !apiKey) {
+      return res.status(400).json({ error: "userUUID, managerId, instanceUrl and apiKey are required" });
+    }
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access || !access.passwordHash) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const config = access.config;
+    await managerAccounts.migrateLegacyManagers(config, userUUID);
+    const normalized = managerAccounts.normalizeInstanceUrl(instanceUrl);
+    const existing = managerAccounts.accountsOf(config)
+      .find(account => account.managerId === managerId && account.instanceUrl === normalized);
+    await managerAccounts.upsertAccount(config, userUUID, {
+      accountId: existing?.id,
+      managerId,
+      instanceUrl: normalized,
+      apiKey,
+      label: existing?.label || managerAccounts.hostLabel(normalized),
+    });
+    await database.saveUserConfig(userUUID, access.passwordHash, config);
+    res.json({ success: true, managerAccounts: config.managerAccounts });
+  } catch (error) {
+    consola.error(`[Managers] Failed to save credentials: ${error.message}`);
+    res.status(500).json({ error: "Failed to save manager credentials" });
+  }
+});
+
+// POST /api/managers/sync - Push one manifest to several accounts at once. Sequential
+// per host, because Hydra rate limits reinstall at 10/min and several accounts can live
+// on the same instance. One failure is reported against its account, not the batch.
+addon.post("/api/managers/sync", async (req, res) => {
+  try {
+    const { userUUID, password, targets } = req.body || {};
+    if (!userUUID || !Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).json({ error: "userUUID and a non-empty targets array are required" });
+    }
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access || !access.passwordHash) {
+      return res.status(401).json({ error: "Invalid UUID or password" });
+    }
+    const config = access.config;
+    await managerAccounts.migrateLegacyManagers(config, userUUID);
+
+    const byHost = new Map<string, Array<{ accountId: string; addonUrl: string }>>();
+    for (const target of targets) {
+      const account = managerAccounts.findAccount(config, target?.accountId);
+      const host = account ? managerAccounts.normalizeInstanceUrl(account.instanceUrl).toLowerCase() : String(target?.accountId);
+      if (!byHost.has(host)) byHost.set(host, []);
+      byHost.get(host).push(target);
+    }
+
+    const delayMs = getManagerSyncHostDelayMs();
+    const results = [];
+    await Promise.all([...byHost.values()].map(async (group) => {
+      for (let i = 0; i < group.length; i++) {
+        const { accountId, addonUrl } = group[i] || {};
+        const account = managerAccounts.findAccount(config, accountId);
+        if (!account) {
+          results.push({ accountId, ok: false, error: "No such account" });
+          continue;
+        }
+        if (!addonUrl || !servedByThisInstance(addonUrl)) {
+          results.push({ accountId, label: account.label, ok: false, error: "addonUrl must be a manifest URL from this addon" });
+          continue;
+        }
+        const apiKey = await managerAccounts.resolveAccountKey(account);
+        if (!apiKey) {
+          results.push({ accountId, label: account.label, ok: false, error: "Stored API key is missing, re-enter it" });
+          continue;
+        }
+        if (i > 0 && delayMs > 0) await sleep(delayMs);
+        const outcome = await hydraReinstall(account.instanceUrl, apiKey, addonUrl);
+        if (outcome.ok) account.lastSyncedAt = new Date().toISOString();
+        results.push({ accountId, label: account.label, ok: outcome.ok, ...(outcome.ok ? {} : { error: outcome.error, status: outcome.status }) });
+      }
+    }));
+
+    await database.saveUserConfig(userUUID, access.passwordHash, config);
+    const synced = results.filter(r => r.ok).length;
+    res.json({ success: synced > 0, synced, failed: results.length - synced, results, managerAccounts: config.managerAccounts });
+  } catch (error) {
+    consola.error(`[Managers] Batch sync failed: ${error.message}`);
+    res.status(500).json({ error: "Failed to sync to the manager accounts" });
+  }
+});
+
+// GET /api/aiomanager/status - Ask an instance whether it serves the Hydra API
+addon.get("/api/aiomanager/status", async (req, res) => {
+  const instanceUrl = typeof req.query.instanceUrl === 'string' ? req.query.instanceUrl.trim() : '';
+  if (!instanceUrl) {
+    return res.status(400).json({ error: "instanceUrl is required" });
+  }
+  let parsed;
+  try {
+    parsed = new URL(instanceUrl);
+  } catch {
+    return res.status(400).json({ error: "instanceUrl must be a valid URL" });
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return res.status(400).json({ error: "instanceUrl must be a http(s) URL" });
+  }
+
+  try {
+    const { httpGet } = require('./utils/httpClient');
+    const response = await httpGet(`${instanceUrl.replace(/\/+$/, '')}/hydra/status`, { timeout: 10000 });
+    // Releases without Hydra answer the SPA catch-all, so HTML means unsupported.
+    if (typeof response.data === 'string' || !response.data?.capabilities) {
+      return res.json({ supported: false });
+    }
+    return res.json({ supported: true, ...response.data });
+  } catch (error) {
+    consola.debug(`[AIOManager Proxy] Status probe failed for ${instanceUrl}: ${error.message}`);
+    return res.json({ supported: false });
+  }
+});
+
+// POST /api/aiomanager/reinstall - Proxy one Hydra reinstall. Takes either a saved
+// accountId, whose key is resolved here so the page never holds it, or a key typed in
+// for a one-off sync that is not being remembered.
+addon.post("/api/aiomanager/reinstall", async (req, res) => {
+  try {
+    const { instanceUrl, apiKey, addonUrl, userUUID, password, accountId } = req.body || {};
+    if (!addonUrl) {
+      return res.status(400).json({ error: "addonUrl is required" });
+    }
+    if (!servedByThisInstance(addonUrl)) {
+      return res.status(400).json({ error: "addonUrl must be a manifest URL from this addon" });
+    }
+
+    let targetUrl = managerAccounts.normalizeInstanceUrl(instanceUrl || '');
+    let targetKey = apiKey;
+
+    if (accountId) {
+      if (!userUUID) {
+        return res.status(400).json({ error: "userUUID is required to sync a saved account" });
+      }
+      const access = await resolveConfigAccess(req, userUUID, password);
+      if (!access || !access.passwordHash) {
+        return res.status(401).json({ error: "Invalid UUID or password" });
+      }
+      await managerAccounts.migrateLegacyManagers(access.config, userUUID);
+      const account = managerAccounts.findAccount(access.config, accountId);
+      if (!account) {
+        return res.status(404).json({ error: "No such account" });
+      }
+      targetKey = await managerAccounts.resolveAccountKey(account);
+      if (!targetKey) {
+        return res.status(400).json({ error: "Stored API key is missing, re-enter it" });
+      }
+      targetUrl = managerAccounts.normalizeInstanceUrl(account.instanceUrl);
+    }
+
+    if (!targetUrl || !targetKey) {
+      return res.status(400).json({ error: "instanceUrl and apiKey are required" });
+    }
+    if (!managerAccounts.isHttpUrl(targetUrl)) {
+      return res.status(400).json({ error: "instanceUrl must be a http(s) URL" });
+    }
+
+    const outcome = await hydraReinstall(targetUrl, targetKey, addonUrl);
+    if (!outcome.ok) {
+      return res.status(outcome.status).json({ error: outcome.error });
+    }
+    res.json(outcome.data);
+  } catch (error) {
+    consola.error(`[AIOManager Proxy] Hydra reinstall failed: ${error.message}`);
+    res.status(502).json({ error: error.message || "Hydra reinstall failed" });
+  }
+});
+
 addon.get("/api/publicmetadb/picks/:pickId/items", async (req, res) => {
   try {
     const { apikey, page } = req.query;
@@ -3048,21 +4070,32 @@ addon.get("/api/publicmetadb/picks/:pickId/items", async (req, res) => {
 });
 
 // --- Admin Configuration Routes ---
-addon.get("/api/config/stats", (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get("/api/config/stats", requireDashboardAdmin, (req, res) => {
   configApi.getStats(req, res);
 });
 
-// --- Cache Warming Endpoints (Admin only) ---
-addon.post("/api/cache/warm", async (req, res) => {
-  // Simple admin check - you might want to implement proper authentication
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
+addon.get("/api/admin/cold-store/stats", requireDashboardAdmin, (req, res) => {
+  try {
+    const metaColdStore = require('./lib/metaColdStore');
+    res.json(metaColdStore.stats());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
+});
+
+addon.post("/api/admin/cold-store/purge", requireDashboardAdmin, (req, res) => {
+  try {
+    const metaColdStore = require('./lib/metaColdStore');
+    const metaId = req.query.metaId;
+    const removed = metaId ? metaColdStore.invalidate(String(metaId)) : metaColdStore.purge();
+    res.json({ success: true, removed });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Cache Warming Endpoints (Admin only) ---
+addon.post("/api/cache/warm", requireDashboardAdmin, async (req, res) => {
   
   try {
     consola.info('[API] Manual API content warming requested');
@@ -3080,29 +4113,21 @@ addon.post("/api/cache/warm", async (req, res) => {
   }
 });
 
-addon.get("/api/cache/status", (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get("/api/cache/status", requireDashboardAdmin, (req, res) => {
   
   const { isInitialWarmingComplete } = require('./lib/cacheWarmer');
   
   res.json({
     cacheEnabled: true,
-    warmingEnabled: ENABLE_CACHE_WARMING,
-    warmingInterval: CACHE_WARMING_INTERVAL,
+    warmingEnabled: isCacheWarmingEnabled(),
+    warmingInterval: cacheWarmingIntervalMinutes(),
     initialWarmingComplete: isInitialWarmingComplete(),
     addonVersion: ADDON_VERSION
   });
 });
 
 // Cache health monitoring endpoints
-addon.get("/api/cache/health", (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get("/api/cache/health", requireDashboardAdmin, (req, res) => {
   
   const health = getCacheHealth();
   res.json({
@@ -3112,11 +4137,7 @@ addon.get("/api/cache/health", (req, res) => {
   });
 });
 
-addon.post("/api/cache/health/clear", (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post("/api/cache/health/clear", requireDashboardAdmin, (req, res) => {
   
   clearCacheHealth();
   res.json({
@@ -3125,11 +4146,7 @@ addon.post("/api/cache/health/clear", (req, res) => {
   });
 });
 
-addon.post("/api/cache/health/log", (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post("/api/cache/health/log", requireDashboardAdmin, (req, res) => {
   
   logCacheHealth();
   res.json({
@@ -3139,11 +4156,7 @@ addon.post("/api/cache/health/log", (req, res) => {
 });
 
 // Clear specific cache key
-addon.delete("/api/cache/clear/:key", async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.delete("/api/cache/clear/:key", requireDashboardAdmin, async (req, res) => {
   
   const { key } = req.params;
   const { pattern } = req.query;
@@ -3221,6 +4234,8 @@ addon.get("/manifest.json", function (req, res) {
 });
 
 // --- Database-Only Manifest Route ---
+require('./lib/collectionExportRoutes').register(addon);
+
 addon.get("/stremio/:userUUID/manifest.json", async function (req, res) {
     const { userUUID } = req.params;
     try {
@@ -3233,9 +4248,26 @@ addon.get("/stremio/:userUUID/manifest.json", async function (req, res) {
             return res.status(404).send({ err: "User configuration not found." });
         }
         
-        const tag = typeof req.query.tag === 'string' ? req.query.tag.trim() : '';
-        consola.debug(`[Manifest] Building fresh manifest for user: ${userUUID}${tag ? ` (tag: ${tag})` : ''}`);
-        const manifest = await getManifest(config, { tag });
+        const { tags, unknown: unknownTags } = resolveManifestTags(config, req.query.tag);
+        req.manifestTags = tags;
+        // The cap itself applies to catalog and search requests, not to the manifest.
+        // It is resolved here anyway so an install URL can be checked before it is used.
+        const installFilters = resolveInstallFilters(config, {
+            rating: req.query.contentrating ?? req.query.contentRating,
+            unrated: req.query.unrated,
+            tags,
+        });
+        const ratingOverride = installFilters.ageRating;
+        const hidesUnrated = installFilters.allowUnrated === false && allowsUnrated(config);
+        const refusedFilters = installFilters.refused;
+        if (refusedFilters.length > 0) {
+            consola.warn(`[Manifest] User ${userUUID} asked for ${refusedFilters.join(', ')}, which does not tighten their configured ${config.ageRating || 'None'}`);
+        }
+        consola.debug(`[Manifest] Building fresh manifest for user: ${userUUID}${tags.length ? ` (tags: ${tags.join(', ')})` : ''}`);
+        if (unknownTags.length > 0) {
+            consola.warn(`[Manifest] User ${userUUID} asked for ${unknownTags.join(', ')}, which no catalog is tagged with`);
+        }
+        const manifest = await getManifest(config, { tags });
             if (!manifest) {
                 res.setHeader('Access-Control-Allow-Origin', '*');
                 res.setHeader('Access-Control-Allow-Headers', '*');
@@ -3264,9 +4296,23 @@ addon.get("/stremio/:userUUID/manifest.json", async function (req, res) {
         manifest._debug = {
             language: config.language || DEFAULT_LANGUAGE,
             configVersion: config.configVersion || Date.now(),
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            ...(tags.length > 0 ? { tags } : {}),
+            ...(unknownTags.length > 0 ? { unknownTags } : {}),
+            ...(ratingOverride ? { contentRating: ratingOverride } : {}),
+            ...(hidesUnrated ? { unrated: 'hidden' } : {}),
+            ...(refusedFilters.length > 0 ? { refusedContentRating: refusedFilters } : {})
         };
         
+        // Only when every named profile agrees, so a mixed install is not labelled with
+        // a cap that half its rows do not carry.
+        const labelRating = req.query.contentrating || req.query.contentRating
+            ? ratingOverride
+            : uniformTagRating(config, tags);
+        if (labelRating) {
+            manifest.name = `${manifest.name} · ${labelRating}`;
+        }
+
         // Add a timestamp to force cache invalidation
         manifest._timestamp = Date.now();
         
@@ -3290,11 +4336,12 @@ addon.get("/stremio/:userUUID/manifest.json", async function (req, res) {
 // --- Catalog Route under /stremio/:userUUID prefix ---
 addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (req, res) {
   const { userUUID, type, id, extra } = req.params;
-  const config = await loadConfigFromDatabase(userUUID);
+  const storedConfig = await loadConfigFromDatabase(userUUID);
   
-  if (!config) {
+  if (!storedConfig) {
     return res.status(404).send({ error: "User configuration not found" });
   }
+  const config = applyRatingOverrides(storedConfig, req, userUUID);
   config.userUUID = userUUID;
 
   // Handle calendar-videos catalog
@@ -3342,7 +4389,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
               return !isNaN(releaseDate.getTime()) && releaseDate >= now;
             });
             
-            meta.videos.sort((a, b) => new Date(a.released) - new Date(b.released));
+            meta.videos.sort((a, b) => new Date(a.released).getTime() - new Date(b.released).getTime());
           }
           
           if (!meta.videos || meta.videos.length === 0) return null;
@@ -3367,7 +4414,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   }
 
   let suffixType = null;
-  const suffixMatch = id.match(/_(movie|series|anime)$/);
+  const suffixMatch = id.match(/_(movie|series|anime|all)$/);
   if (suffixMatch) {
     suffixType = suffixMatch[1];
   }
@@ -3396,7 +4443,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   // e.g. "streaming.nfx_series" -> "streaming.nfx"
   if (!catalogConfig) {
     consola.debug(`[CATALOG ROUTE] No catalog config found for id: ${id}, type: ${type}`);
-    const strippedId = id.replace(/_(movie|series|anime)$/, '');
+    const strippedId = id.replace(/_(movie|series|anime|all)$/, '');
     
     // Only proceed if a replacement actually happened
     if (strippedId !== id) {
@@ -3446,7 +4493,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
   // Pass config to req for ETag generation
   req.userConfig = config;
-  let extraArgs = {};
+  let extraArgs: any = {};
   if (extra) {
     extraArgs = Object.fromEntries(new URLSearchParams(req.url.split("/").pop().split("?")[0].slice(0, -5)).entries());
   }
@@ -3454,8 +4501,12 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
   extraArgs = extraArgs || {};
   // Ensure sort options are included in cache key
+  // Claimed before the provider prefixes; anilist.discover would otherwise match anilist.
+  if (isDiscoverCatalogId(cleanId)) {
+    applyDiscoverSignature(extraArgs, catalogConfig);
+  }
   // Trakt uses: sort, sortDirection
-  if (cleanId.startsWith('trakt.')) {
+  else if (cleanId.startsWith('trakt.')) {
     if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
     if (catalogConfig?.sortDirection) extraArgs.sortDirection = catalogConfig.sortDirection;
   }
@@ -3463,8 +4514,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   else if (cleanId.startsWith('mdblist.')) {
     if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
     if (catalogConfig?.order) extraArgs.order = catalogConfig.order;
-    // Add score filters for MDBList external lists
-    if (catalogConfig?.source === 'mdblist' && catalogConfig?.sourceUrl && catalogConfig?.sourceUrl.includes('/external/lists/')) {
+    if (supportsMdblistScoreFilters(catalogConfig)) {
       if (typeof catalogConfig.filter_score_min === 'number') {
         extraArgs.filter_score_min = catalogConfig.filter_score_min;
       }
@@ -3477,23 +4527,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   else if (cleanId.startsWith('streaming.') || cleanId.startsWith('tmdb.year') || cleanId.startsWith('tmdb.language')) {
     if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
     if (catalogConfig?.sortDirection) extraArgs.sortDirection = catalogConfig.sortDirection;
-  }
-  // Discover custom catalogs use discover params (include hash for safe cache invalidation)
-  else if (cleanId.startsWith('tmdb.discover.') || cleanId.startsWith('tvdb.discover.') || cleanId.startsWith('simkl.discover.') || cleanId.startsWith('anilist.discover.') || cleanId.startsWith('mal.discover.')) {
-    const discoverParams =
-      catalogConfig?.metadata?.discover?.params ||
-      catalogConfig?.metadata?.discoverParams ||
-      null;
-    if (discoverParams && typeof discoverParams === 'object') {
-      const discoverParamsForSignature = cleanId.startsWith('tmdb.discover.')
-        ? resolveDynamicTmdbDiscoverParams(discoverParams, { timezone: config.timezone })
-        : discoverParams;
-      const discoverSignature = crypto
-        .createHash('md5')
-        .update(stableStringify(discoverParamsForSignature))
-        .digest('hex')
-        .substring(0, 8);
-      extraArgs.discoverSig = discoverSignature;
+    if (cleanId.startsWith('tmdb.year') && typeof catalogConfig?.minVotes === 'number') {
+      extraArgs.minVotes = catalogConfig.minVotes;
     }
   }
   // AniList uses: sort, sortDirection
@@ -3501,11 +4536,31 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
     if (catalogConfig?.sortDirection) extraArgs.sortDirection = catalogConfig.sortDirection;
   }
+  // MAL user lists use: sort
+  else if (cleanId.startsWith('mal.userlist.')) {
+    if (catalogConfig?.sort) extraArgs.sort = catalogConfig.sort;
+  }
+  // MovieLens uses: sortBy, sortDirection, tags, minYear, maxYear, minPop, maxDaysAgo, maxFutureDays
+  else if (cleanId.startsWith('movielens.')) {
+    const mlMeta: any = catalogConfig?.metadata || {};
+    if (mlMeta.sortBy) extraArgs.sort = mlMeta.sortBy;
+    if (mlMeta.sortDirection) extraArgs.sortDirection = mlMeta.sortDirection;
+    if (mlMeta.tags) extraArgs.tags = mlMeta.tags;
+    if (mlMeta.minYear) extraArgs.minYear = mlMeta.minYear;
+    if (mlMeta.maxYear) extraArgs.maxYear = mlMeta.maxYear;
+    if (mlMeta.minPop) extraArgs.minPop = mlMeta.minPop;
+    if (mlMeta.maxDaysAgo) extraArgs.maxDaysAgo = mlMeta.maxDaysAgo;
+    if (mlMeta.maxFutureDays !== undefined) extraArgs.maxFutureDays = mlMeta.maxFutureDays;
+    if (mlMeta.includeRated) extraArgs.includeRated = true;
+  }
   // Up next catalogs need poster preference and filter settings in cache key
-  if (cleanId === 'trakt.upnext' || cleanId === 'mdblist.upnext') {
+  if (cleanId === 'trakt.upnext' || cleanId === 'mdblist.upnext' || cleanId.startsWith('simkl.upnext')) {
       extraArgs.useShowPoster = typeof catalogConfig?.metadata?.useShowPosterForUpNext === 'boolean'
         ? catalogConfig.metadata.useShowPosterForUpNext
         : false;
+  }
+  if (cleanId === 'simkl.upnext') {
+      extraArgs.includeAnime = catalogConfig?.metadata?.includeAnimeInUpNext !== false;
   }
   if (cleanId === 'mdblist.upnext') {
       if (catalogConfig?.metadata?.hideUnreleased !== undefined) {
@@ -3555,11 +4610,13 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   let catalogPageSize;
   if (cleanId.startsWith('flixpatrol.')) {
     catalogPageSize = 10;
+  } else if (cleanId.startsWith('mal.userlist.') || cleanId === 'mal.suggestions') {
+    catalogPageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
   } else if (cleanId.includes('mal.')) {
-    catalogPageSize = 25;
+    catalogPageSize = parseInt(process.env.MAL_PAGE_SIZE || '25');
   } else if (cleanId === 'anilist.trending' || cleanId.startsWith('anilist.discover')) {
     catalogPageSize = 50;
-  } else if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.dvd.') || cleanId.startsWith('simkl.trending.') || cleanId.startsWith('simkl.recipe.') || cleanId.startsWith('stremthru.') || cleanId.startsWith('mdblist.') || cleanId.startsWith('custom.') || cleanId.startsWith('trakt.') || cleanId.startsWith('anilist.') || cleanId.startsWith('letterboxd.') || (cleanId.startsWith('tvdb.') && !cleanId.startsWith('tvdb.collection.'))) {
+  } else if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext') || cleanId.startsWith('simkl.dvd.') || cleanId.startsWith('simkl.trending.') || cleanId.startsWith('simkl.recipe.') || cleanId.startsWith('stremthru.') || cleanId.startsWith('mdblist.') || cleanId.startsWith('custom.') || cleanId.startsWith('trakt.') || cleanId.startsWith('anilist.') || cleanId.startsWith('letterboxd.') || cleanId.startsWith('movielens.') || (cleanId.startsWith('tvdb.') && !cleanId.startsWith('tvdb.collection.'))) {
     catalogPageSize = parseInt(process.env.CATALOG_LIST_ITEMS_SIZE || '20');
   } else {
     catalogPageSize = 20;
@@ -3576,15 +4633,30 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
   delete cacheExtraArgs.skip;
   if (catalogPage > 1) cacheExtraArgs.page = catalogPage;
 
-  if (cleanId.startsWith('simkl.watchlist.')) {
+  if (cleanId.startsWith('simkl.watchlist.') || cleanId.startsWith('simkl.upnext')) {
     try {
       const { getSimklToken, getSimklActivityFingerprint } = require('./utils/simklUtils');
       const tokenId = config.apiKeys?.simklTokenId;
       if (tokenId) {
         const token = await getSimklToken(tokenId);
         if (token?.access_token) {
-          const parts = cleanId.split('.');
-          const fp = await getSimklActivityFingerprint(token.access_token, parts[2], parts[3]);
+          // Up Next reads whichever buckets it renders, so its key has to move when
+          // any of them does, not just when the shows bucket does.
+          let pairs;
+          if (cleanId === 'simkl.upnext.anime') {
+            pairs = [['anime', 'watching']];
+          } else if (cleanId === 'simkl.upnext') {
+            pairs = extraArgs.includeAnime === false
+              ? [['shows', 'watching']]
+              : [['shows', 'watching'], ['anime', 'watching']];
+          } else {
+            const parts = cleanId.split('.');
+            pairs = [[parts[2], parts[3]]];
+          }
+          const fps = await Promise.all(
+            pairs.map(([t, s]) => getSimklActivityFingerprint(token.access_token, t, s))
+          );
+          const fp = fps.filter(Boolean).join('+');
           if (fp) cacheExtraArgs._simklAct = fp;
         }
       }
@@ -3593,7 +4665,25 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     }
   }
 
-  const catalogKey = `${cleanId}:${actualType}:${stableStringify(cacheExtraArgs)}`;
+  if (cleanId.startsWith('movielens.explore')) {
+    try {
+      const credId = config.apiKeys?.movieLensCredId;
+      const catCfg = config.catalogs?.find(c => c.id === cleanId);
+      const explicitTags = String(catCfg?.metadata?.tags || '')
+        .split(',').map(s => s.trim()).filter(Boolean).join(',');
+      if (credId && !explicitTags) {
+        const metaTtl = parseInt(
+          process.env.MOVIELENS_USERMETA_TTL_SECONDS || process.env.MOVIELENS_GROUPTAGS_TTL_SECONDS || '43200', 10);
+        const userMeta = await cacheWrapGlobal(`movielens-usermeta:${credId}`,
+          async () => movielens.getUserMeta(credId), metaTtl);
+        if (userMeta?.engineId === 'bard' && Array.isArray(userMeta.groupTags) && userMeta.groupTags.length) {
+          cacheExtraArgs._mlTags = userMeta.groupTags.map(t => t.trim()).filter(Boolean).join(',');
+        }
+      }
+    } catch (e) {
+      consola.warn(`[Catalog] MovieLens group tags failed for ${cleanId}: ${e.message}`);
+    }
+  }
 
   const cacheOptions = {
     enableErrorCaching: true,
@@ -3606,6 +4696,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     // Set by any branch whose handler already ran applyCatalogFilters internally
     // (external addon catalogs filter before computing their pagination cursor).
     let filtersAlreadyApplied = false;
+    let pendingCursor = null;
 
       if (cleanId === 'search' || cleanId === 'gemini.search' || cleanId === 'people_search') {
       let originalSearchId = null;
@@ -3669,7 +4760,9 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
 
       // Compute search-specific page size based on the provider's actual results per page
       let searchPageSize = 20; // default (TMDB, Kitsu)
-      if (searchEngine && (searchEngine.startsWith('tvdb.') || searchEngine.startsWith('mal.'))) {
+      if (searchEngine && searchEngine.startsWith('mal.')) {
+        searchPageSize = parseInt(process.env.MAL_PAGE_SIZE || '25');
+      } else if (searchEngine && searchEngine.startsWith('tvdb.')) {
         searchPageSize = 25;
       } else if (searchEngine && searchEngine.startsWith('trakt.')) {
         searchPageSize = 30;
@@ -3681,13 +4774,31 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       delete searchExtraArgs.skip;
       if (searchPage > 1) searchExtraArgs.page = searchPage;
 
-      // Use search-specific cache wrapper
-      const searchKey = `${cleanId}:${originalSearchId}:${searchType}:${stableStringify(searchExtraArgs)}`;
+      // Optional keyword gate for AI search.
+      const aiKeyword = getAiTriggerKeyword(config);
+      let aiGateBlocked = false;
 
-      responseData = await cacheWrapSearch(userUUID, searchKey, async () => {
-        const searchResult = await getSearch(cleanId, searchType, language, searchExtraArgs, config);
-        return { metas: searchResult.metas || [] };
-      }, searchEngine, cacheOptions);
+      if (searchEngine === 'gemini.search' && aiKeyword) {
+        const aiTrigger = applyAiTrigger(searchExtraArgs.search || '', aiKeyword);
+        if (aiTrigger.matched && aiTrigger.query) {
+          searchExtraArgs.search = aiTrigger.query;
+        } else {
+          // Query lacks the trigger keyword (or is only the keyword) — no AI call.
+          aiGateBlocked = true;
+        }
+      }
+
+      if (aiGateBlocked) {
+        responseData = { metas: [] };
+      } else {
+        // Use search-specific cache wrapper
+        const searchKey = `${cleanId}:${originalSearchId}:${searchType}:${stableStringify(searchExtraArgs)}`;
+
+        responseData = await cacheWrapSearch(userUUID, searchKey, async () => {
+          const searchResult = await getSearch(cleanId, searchType, language, searchExtraArgs, config);
+          return { metas: searchResult.metas || [] };
+        }, searchEngine, cacheOptions);
+      }
       } else if (cleanId.startsWith('custom.') || cleanId.startsWith('stremthru.')) {
       const { genre: genreName } = extraArgs;
       const skipValue = extraArgs.skip !== undefined ? parseInt(extraArgs.skip) : 0;
@@ -3699,12 +4810,11 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       const skipValue = extraArgs.skip !== undefined ? parseInt(extraArgs.skip) : 0;
       const result = await getCatalog(actualType, language, catalogPage, cleanId, genreName, config, userUUID, false, skipValue);
       responseData = { metas: result.metas || [] };
+      filtersAlreadyApplied = true;
       } else {
-      // Use regular catalog cache wrapper
-      responseData = await cacheWrapper(userUUID, catalogKey, async () => {
+      const { genre: genreName, type_filter } = extraArgs;
+      const runCatalogPage = async (page, skipOverride) => {
         let metas = [];
-        const { genre: genreName, type_filter } = extraArgs;
-        const page = catalogPage;
         const args = [actualType, language, page];
         switch (cleanId) {
           case "tmdb.trending":
@@ -3728,18 +4838,18 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
             break;
           }
           case 'mal.genres': {
-            const mediaType = type_filter || 'series';
+            const mediaType = type_filter || null;
             const allAnimeGenres = await cacheWrapJikanApi('anime-genres', async () => {
               return await jikan.getAnimeGenres();
-            }, null, { skipVersion: true });
+            }, null);
             const genreNameToFetch = genreName || allAnimeGenres[0]?.name;
             if (genreNameToFetch) {
               const selectedGenre = allAnimeGenres.find(g => g.name === genreNameToFetch);
               if (selectedGenre) {
                 const genreId = selectedGenre.mal_id;
-                const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType}-${page}-${config.sfw}`, async () => {
+                const animeResults = await cacheWrapJikanApi(`mal-genre-${genreId}-${mediaType || 'all'}-${page}-${config.sfw}`, async () => {
                   return await jikan.getAnimeByGenre(genreId, mediaType, page, config);
-                }, null, { skipVersion: true });
+                }, null);
                 metas = await parseAnimeCatalogMetaBatch(animeResults, config, language);
               }
             }
@@ -3758,16 +4868,50 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
             break;
           }
           default: {
-            const skipValue = extraArgs.skip ? parseInt(extraArgs.skip) : undefined;
-            metas = (await getCatalog(actualType, language, page, cleanId, genreName, config, userUUID, false, skipValue)).metas;
+            metas = (await getCatalog(actualType, language, page, cleanId, genreName, config, userUUID, false, skipOverride)).metas;
             break;
           }
       }
       return { metas: metas || [] };
-    }, cacheOptions);
+    };
+
+    const keyForPage = (page) => {
+      const pageArgs = { ...cacheExtraArgs };
+      if (page > 1) pageArgs.page = page; else delete pageArgs.page;
+      return `${cleanId}:${actualType}:${stableStringify(pageArgs)}`;
+    };
+
+    const legacySkip = extraArgs.skip ? parseInt(extraArgs.skip) : undefined;
+    const readPage = (page, skipOverride) =>
+      cacheWrapper(userUUID, keyForPage(page), () => runCatalogPage(page, skipOverride), cacheOptions);
+
+    if (catalogFiltersActive({ config, catalogConfig, cleanId })) {
+      const key = cursorKey(userUUID, cleanId, actualType, genreName);
+      const skipValue = legacySkip || 0;
+      const { startPage, startOffset, matched } = await resolveStartPage(key, skipValue, catalogPage);
+
+      const filled = await fillFilteredPage({
+        startPage,
+        startOffset,
+        pageSize: catalogPageSize,
+        fetchPage: async (page) => (await readPage(page, undefined))?.metas || [],
+        filter: (metas) => applyCatalogFilters(metas, { type: actualType, config, catalogConfig, cleanId }),
+      });
+
+      responseData = { metas: filled.metas };
+      filtersAlreadyApplied = true;
+      pendingCursor = { key, skip: skipValue, page: filled.nextPage, offset: filled.nextOffset };
+
+      consola.debug(
+        `[Catalog] ${cleanId}: filled ${filled.metas.length}/${catalogPageSize} from ${filled.pagesRead} page(s) ` +
+        `(skip=${skipValue}, start=${startPage}+${startOffset}, next=${filled.nextPage}+${filled.nextOffset}, ` +
+        `cursor=${matched ? 'hit' : 'miss'}, exhausted=${filled.exhausted})`
+      );
+    } else {
+      responseData = await readPage(catalogPage, legacySkip);
+    }
     }
     if (!filtersAlreadyApplied && responseData?.metas && Array.isArray(responseData.metas) && responseData.metas.length > 0) {
-      const { applyCatalogFilters } = require('./utils/catalogFilters');
       responseData.metas = await applyCatalogFilters(responseData.metas, {
         type: actualType,
         config,
@@ -3792,6 +4936,14 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
       }
     }
 
+    if (pendingCursor) {
+      await writeCursor(pendingCursor.key, {
+        served: pendingCursor.skip + (responseData?.metas?.length || 0),
+        upstreamPage: pendingCursor.page,
+        pageOffset: pendingCursor.offset,
+      });
+    }
+
 
     if (catalogConfig?.randomizePerPage && Array.isArray(responseData?.metas) && responseData.metas.length > 1) {
       responseData = {
@@ -3807,8 +4959,8 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
     const posterPatternsEnabled = config._currentSearchCatalogId
       ? (config.search?.engineRatingPosters?.[config._currentSearchCatalogId] === true)
       : (catalogConfig?.enableRatingPosters !== false);
-    const posterPattern = posterPatternsEnabled ? (config.customPosterUrlPattern || (config.posterRatingProvider && config.posterRatingProvider !== 'custom' ? require('./utils/parseProps').getDefaultPosterPattern(config.posterRatingProvider) : null)) : null;
-    if ((posterPattern || config.customBackgroundUrlPattern || config.customLogoUrlPattern) && responseData?.metas && Array.isArray(responseData.metas)) {
+    const posterPattern = posterPatternsEnabled ? require('./utils/parseProps').resolvePosterPattern(config) : null;
+    if ((posterPattern || config.customBackgroundUrlPattern || config.customLandscapeUrlPattern || config.customLogoUrlPattern) && responseData?.metas && Array.isArray(responseData.metas)) {
       const isUpNextCatalog = cleanId.includes('up_next') || cleanId.includes('upnext');
       const upNextUsesShowPoster = isUpNextCatalog && catalogConfig?.metadata?.useShowPosterForUpNext === true;
       const { resolveCustomArtUrl, getPosterRatingApiKey } = require('./utils/parseProps');
@@ -3820,7 +4972,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
           if (proxyApiKey) {
             const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
             if (proxyId) {
-              meta.poster = `${host}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&lang=${config.language || 'en-US'}&key=${proxyApiKey}`;
+              meta.poster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'poster', type: type, id: proxyId, fallback: meta.poster, ratingKey: proxyApiKey, lang: config.language });
             }
           } else {
             const resolved = resolveCustomArtUrl(posterPattern, ids, type, config);
@@ -3828,7 +4980,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
               if (config.usePosterProxy) {
                 const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
                 if (proxyId) {
-                  meta.poster = `${host}/poster/${type}/${proxyId}?fallback=${encodeURIComponent(meta.poster || '')}&url=${encodeURIComponent(resolved)}`;
+                  meta.poster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'poster', type: type, id: proxyId, fallback: meta.poster, url: resolved });
                 }
               } else {
                 meta.poster = resolved;
@@ -3842,12 +4994,27 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
             if (config.usePosterProxy) {
               const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
               if (proxyId) {
-                meta.background = `${host}/background/${type}/${proxyId}?fallback=${encodeURIComponent(meta.background || '')}&url=${encodeURIComponent(resolved)}`;
+                meta.background = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'background', type: type, id: proxyId, fallback: meta.background, url: resolved });
               } else {
                 meta.background = resolved;
               }
             } else {
               meta.background = resolved;
+            }
+          }
+        }
+        if (config.customLandscapeUrlPattern) {
+          const resolved = resolveCustomArtUrl(config.customLandscapeUrlPattern, ids, type, config);
+          if (resolved) {
+            if (config.usePosterProxy) {
+              const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
+              if (proxyId) {
+                meta.landscapePoster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'landscape', type: type, id: proxyId, fallback: meta.landscapePoster, url: resolved });
+              } else {
+                meta.landscapePoster = resolved;
+              }
+            } else {
+              meta.landscapePoster = resolved;
             }
           }
         }
@@ -3857,7 +5024,7 @@ addon.get("/stremio/:userUUID/catalog/:type/:id{/:extra}.json", async function (
             if (config.usePosterProxy) {
               const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
               if (proxyId) {
-                meta.logo = `${host}/logo/${type}/${proxyId}?fallback=${encodeURIComponent(meta.logo || '')}&url=${encodeURIComponent(resolved)}`;
+                meta.logo = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'logo', type: type, id: proxyId, fallback: meta.logo, url: resolved });
               } else {
                 meta.logo = resolved;
               }
@@ -3889,9 +5056,10 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
   
   // Add userUUID to config for per-user token caching
   config.userUUID = userUUID;
-  
+  config.addonIdentifier = req.addonIdentifier || userUUID;
+
   const language = config.language || DEFAULT_LANGUAGE;
-  const fullConfig = config; 
+  const fullConfig = config;
   
   // Pass config to req for ETag generation
   req.userConfig = config; 
@@ -3922,6 +5090,13 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
     if (type === 'series' && stremioId && stremioId.startsWith('pmdb_resume_')) {
       const catalogConfig = fullConfig.catalogs?.find(c => c.id === 'publicmetadb.upnext');
       if (catalogConfig?.metadata?.useShowPosterForUpNext !== undefined) {
+        useShowPoster = catalogConfig.metadata.useShowPosterForUpNext;
+      }
+    }
+    if (type === 'series' && stremioId && stremioId.startsWith('simkl_upnext_')) {
+      const catalogConfig = fullConfig.catalogs?.find(c => c.id.startsWith('simkl.upnext')
+        && c.metadata?.useShowPosterForUpNext !== undefined);
+      if (catalogConfig) {
         useShowPoster = catalogConfig.metadata.useShowPosterForUpNext;
       }
     }
@@ -3964,18 +5139,18 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
     {
       const userAgent = req.headers['user-agent'] || '';
       const host = process.env.HOST_NAME.startsWith('http') ? process.env.HOST_NAME : `https://${process.env.HOST_NAME}`;
-      const { resolveCustomArtUrl, getDefaultPosterPattern, getDefaultThumbnailPattern, getPosterRatingApiKey } = require('./utils/parseProps');
+      const { resolveCustomArtUrl, resolvePosterPattern, resolveThumbnailPattern, getPosterRatingApiKey } = require('./utils/parseProps');
       const ids = extractIdsFromMeta(result.meta);
       const metaType = result.meta.type || type;
       // Apply poster pattern unless enableRatingPostersForLibrary is explicitly disabled
       if (config.enableRatingPostersForLibrary !== false) {
-        const metaPosterPattern = config.customPosterUrlPattern || (config.posterRatingProvider && config.posterRatingProvider !== 'custom' ? getDefaultPosterPattern(config.posterRatingProvider) : null);
+        const metaPosterPattern = resolvePosterPattern(config);
         if (metaPosterPattern) {
           const proxyApiKey = config.usePosterProxy ? getPosterRatingApiKey(config) : null;
           if (proxyApiKey) {
             const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
             if (proxyId) {
-              result.meta.poster = `${host}/poster/${metaType}/${proxyId}?fallback=${encodeURIComponent(result.meta.poster || '')}&lang=${config.language || 'en-US'}&key=${proxyApiKey}`;
+              result.meta.poster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'poster', type: metaType, id: proxyId, fallback: result.meta.poster, ratingKey: proxyApiKey, lang: config.language });
             }
           } else {
             const resolved = resolveCustomArtUrl(metaPosterPattern, ids, metaType, config, { userAgent });
@@ -3983,7 +5158,7 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
               if (config.usePosterProxy) {
                 const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
                 if (proxyId) {
-                  result.meta.poster = `${host}/poster/${metaType}/${proxyId}?fallback=${encodeURIComponent(result.meta.poster || '')}&url=${encodeURIComponent(resolved)}`;
+                  result.meta.poster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'poster', type: metaType, id: proxyId, fallback: result.meta.poster, url: resolved });
                 }
               } else {
                 result.meta.poster = resolved;
@@ -3998,12 +5173,27 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
           if (config.usePosterProxy) {
             const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
             if (proxyId) {
-              result.meta.background = `${host}/background/${metaType}/${proxyId}?fallback=${encodeURIComponent(result.meta.background || '')}&url=${encodeURIComponent(resolved)}`;
+              result.meta.background = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'background', type: metaType, id: proxyId, fallback: result.meta.background, url: resolved });
             } else {
               result.meta.background = resolved;
             }
           } else {
             result.meta.background = resolved;
+          }
+        }
+      }
+      if (config.customLandscapeUrlPattern) {
+        const resolved = resolveCustomArtUrl(config.customLandscapeUrlPattern, ids, metaType, config, { userAgent });
+        if (resolved) {
+          if (config.usePosterProxy) {
+            const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
+            if (proxyId) {
+              result.meta.landscapePoster = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'landscape', type: metaType, id: proxyId, fallback: result.meta.landscapePoster, url: resolved });
+            } else {
+              result.meta.landscapePoster = resolved;
+            }
+          } else {
+            result.meta.landscapePoster = resolved;
           }
         }
       }
@@ -4013,7 +5203,7 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
           if (config.usePosterProxy) {
             const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
             if (proxyId) {
-              result.meta.logo = `${host}/logo/${metaType}/${proxyId}?fallback=${encodeURIComponent(result.meta.logo || '')}&url=${encodeURIComponent(resolved)}`;
+              result.meta.logo = buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'logo', type: metaType, id: proxyId, fallback: result.meta.logo, url: resolved });
             } else {
               result.meta.logo = resolved;
             }
@@ -4023,7 +5213,7 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
         }
       }
       // Apply thumbnail pattern to episode videos
-      const thumbnailPattern = config.customThumbnailUrlPattern || (config.posterRatingProvider && config.posterRatingProvider !== 'custom' ? getDefaultThumbnailPattern(config.posterRatingProvider) : null);
+      const thumbnailPattern = resolveThumbnailPattern(config);
       if (thumbnailPattern && result.meta.videos && Array.isArray(result.meta.videos)) {
         for (const video of result.meta.videos) {
           const idParts = video.id?.split(':');
@@ -4044,7 +5234,15 @@ addon.get("/stremio/:userUUID/meta/:type/:id.json", async function (req, res) {
                 userAgent,
               });
               if (resolved) {
-                video.thumbnail = resolved;
+                if (config.usePosterProxy) {
+                  const proxyId = ids.imdbId || (ids.tmdbId ? `tmdb:${ids.tmdbId}` : (ids.tvdbId ? `tvdb:${ids.tvdbId}` : null));
+                  // Episode thumbnails share the show's proxyId; the per-episode url param keeps the proxy cache/etag distinct.
+                  video.thumbnail = proxyId
+                    ? buildProxyArtUrl({ base: `${host}/poster-cache/proxy`, imageClass: 'background', type: metaType, id: proxyId, fallback: originalThumb, url: resolved })
+                    : resolved;
+                } else {
+                  video.thumbnail = resolved;
+                }
               }
             }
           }
@@ -4165,22 +5363,8 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
       return respond(req, res, { subtitles: [] }, { cacheMaxAge: 0 });
     }
     
-    // Check if any watch tracking is enabled (MDBList, AniList, Simkl, or Trakt)
-    const hasMdblistKey = config?.apiKeys?.mdblist;
-    const mdblistEnabled = !!config?.mdblistWatchTracking;
-    const hasAnilistToken = config?.apiKeys?.anilistTokenId;
-    const anilistEnabled = !!config?.anilistWatchTracking;
-    const hasSimklToken = config?.apiKeys?.simklTokenId;
-    const simklEnabled = !!config?.simklWatchTracking;
-    const hasTraktToken = config?.apiKeys?.traktTokenId;
-    const traktEnabled = !!config?.traktWatchTracking;
-
-    const shouldTrackMdblist = hasMdblistKey && mdblistEnabled;
-    const shouldTrackAnilist = hasAnilistToken && anilistEnabled;
-    const shouldTrackSimkl = hasSimklToken && simklEnabled;
-    const shouldTrackTrakt = hasTraktToken && traktEnabled;
-
-    if (shouldTrackMdblist || shouldTrackAnilist || shouldTrackSimkl || shouldTrackTrakt) {      // Import and call subtitle handler
+    if (hasAnyWatchTrackingEnabled(config)) {
+      // Import and call subtitle handler
       const { handleSubtitleRequest } = require('./lib/subtitleHandler');
       
       // Call handler synchronously (no await)
@@ -4190,7 +5374,7 @@ addon.get("/stremio/:userUUID/subtitles/:type/:id{/:extra}.json", async function
       return respond(req, res, result, { cacheMaxAge: 0 });
     } else {
       // Watch tracking disabled or no credentials - return empty subtitles
-      consola.debug(`[Watch Tracking] Skipped for user ${userUUID} - mdblist: ${shouldTrackMdblist}, anilist: ${shouldTrackAnilist}, simkl: ${shouldTrackSimkl}, trakt: ${shouldTrackTrakt}`);
+      consola.debug(`[Watch Tracking] Skipped for user ${userUUID} - no service has an enabled media type and valid credentials`);
       return respond(req, res, { subtitles: [] }, { cacheMaxAge: 0 });
     }
   } catch (error) {
@@ -4270,7 +5454,7 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
           
           if (tmdbId || imdbId || tvdbId) {
             // Build IDs object for Trakt (only include non-null values)
-            const ids = {};
+            const ids: any = {};
             if (tmdbId) ids.tmdb = parseInt(tmdbId, 10);
             if (imdbId) ids.imdb = imdbId;
             if (tvdbId) ids.tvdb = parseInt(tvdbId, 10);
@@ -4403,7 +5587,7 @@ addon.post("/stremio/:userUUID/rating", async function (req, res) {
           const mdblistType = type.toLowerCase() === 'series' ? 'shows' : 'movies';
           
           // Build IDs object for MDBList
-          const ids = {};
+          const ids: any = {};
           if (tmdbId) ids.tmdb = parseInt(tmdbId);
           if (imdbId) ids.imdb = imdbId;
           if (tvdbId) ids.tvdb = parseInt(tvdbId);
@@ -4491,117 +5675,184 @@ addon.get("/api/proxy-manifest", async function (req, res) {
 
 // API endpoint to auto-detect page size for external addon catalogs
 
-function POSTER_PROXY_TIMEOUT_MS() { return parseInt(process.env.POSTER_PROXY_TIMEOUT_MS || '10000', 10); }
+function isProcessedImageCacheEnabled() {
+  return posterCacheConfig.isClassEnabled('processed');
+}
 
-async function fetchPosterImageStream(posterUrl) {
-  const imageResponse = await axios({
-    method: 'get',
-    url: posterUrl,
-    responseType: 'stream',
-    timeout: POSTER_PROXY_TIMEOUT_MS(),
-    maxRedirects: 5,
-    validateStatus: (status) => status >= 200 && status < 300,
-    headers: { 'User-Agent': `AIOMetadata/${buildInfo.version}` }
+
+async function readEntryBytes(entry) {
+  if (entry.body) return entry.body;
+  const chunks = [];
+  for await (const chunk of entry.openStream()) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+async function produceProcessedBytes(bareUrl, fetchFallback) {
+  const posterCacheStore = require('./lib/posterCache/store.js');
+  const migrated = await posterCacheStore.get('poster', bareUrl);
+  if (migrated && !migrated.expired) {
+    return {
+      body: await readEntryBytes(migrated),
+      contentType: migrated.contentType,
+      upstream: migrated.upstream,
+    };
+  }
+  return fetchFallback();
+}
+
+async function sendCachedImage(res, result, fallbackContentType?) {
+  const { entry } = result;
+  res.setHeader('X-Cache-Status', result.status);
+  res.setHeader('Content-Type', entry.contentType || fallbackContentType || 'image/jpeg');
+  res.setHeader('Content-Length', String(entry.size));
+  if (entry.body) {
+    res.end(entry.body);
+    return;
+  }
+  await stream.promises.pipeline(entry.openStream(), res);
+}
+
+// The `blur:` and `b2b:` transforms: rendered locally from an already-cached
+// source, so they carry no upstream headers to follow.
+async function cacheProcessedImage(cacheKey, contentType, produce) {
+  const posterCacheStore = require('./lib/posterCache/store.js');
+  return posterCacheStore.getOrFetch('processed', cacheKey, async () => {
+    const chunks = [];
+    const sink = new stream.PassThrough();
+    sink.on('data', (chunk) => chunks.push(chunk));
+    const drained = new Promise((resolve, reject) => {
+      sink.on('end', resolve);
+      sink.on('error', reject);
+    });
+    await produce(sink);
+    await drained;
+    return { body: Buffer.concat(chunks), contentType };
   });
-
-  const contentType = imageResponse.headers['content-type'];
-  if (contentType && !contentType.toLowerCase().startsWith('image/')) {
-    imageResponse.data.destroy();
-    throw new Error(`Poster URL returned non-image content-type: ${contentType}`);
-  }
-
-  const contentLength = imageResponse.headers['content-length'];
-  const parsedContentLength = contentLength ? parseInt(contentLength, 10) : null;
-  if (Number.isFinite(parsedContentLength) && parsedContentLength < 100) {
-    imageResponse.data.destroy();
-    throw new Error(`Poster URL returned too-small content-length: ${contentLength}`);
-  }
-
-  return imageResponse;
 }
 
-function pipePosterImageResponse(res, imageResponse) {
-  const contentType = imageResponse.headers['content-type'];
-  res.setHeader('Content-Type', contentType || 'image/jpeg');
-  res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
-  imageResponse.data.pipe(res);
+const refusalsWarned = new Set();
+function warnRefusedOrigin(context, message) {
+  const line = `${context}: ${message}`;
+  if (refusalsWarned.has(line) || refusalsWarned.size >= 20) return;
+  refusalsWarned.add(line);
+  consola.warn(
+    `${line}. If that host is yours, add it to POSTER_CACHE_ALLOWED_HOSTS, or set ` +
+    `IMAGE_PROXY_SIGNING_SECRET (or ADMIN_KEY) so the addon signs the art URLs it issues.`
+  );
 }
 
-addon.get("/poster/:type/:id", async function (req, res) {
+const handlePosterProxy = async function (req, res) {
   const { type, id } = req.params;
-  const { fallback, lang, key, url: customUrl } = req.query;
+  const { fallback, lang, key, url: customUrl, sig } = req.query;
+  const sendFallback = () => (fallback ? res.redirect(302, fallback) : res.status(404).end());
   if (!key && !customUrl) {
-    return res.redirect(302, fallback);
+    return sendFallback();
   }
-  const etag = crypto.createHash('md5').update(`${type}:${id}:${customUrl || key}:${lang}`).digest('hex');
-  res.setHeader('ETag', `"${etag}"`);
-  if (req.headers['if-none-match'] === `"${etag}"`) {
-    return res.status(304).end();
-  }
-
   try {
     let posterUrl = customUrl || null;
 
     if (!posterUrl) {
-      const [idSource, idValue] = id.startsWith('tt') ? ['imdb', id] : id.split(':');
-      const ids = {
-        tmdbId: idSource === 'tmdb' ? idValue : null,
-        tvdbId: idSource === 'tvdb' ? idValue : null,
-        imdbId: idSource === 'imdb' ? idValue : null,
-      };
-      const isTopPoster = key.startsWith('TP-');
-      if (isTopPoster) {
-        const config = { apiKeys: { topPoster: key }, posterRatingProvider: 'top' };
-        posterUrl = getRatingPosterUrl(type, ids, lang, config, fallback);
-      } else {
-        posterUrl = getRpdbPoster(type, ids, lang, key);
-      }
+      posterUrl = resolveProxyRatingPosterUrl(type, id, lang, key, fallback);
     }
 
     if (!posterUrl) {
-      return res.redirect(302, fallback);
+      return sendFallback();
     }
 
-    const imageResponse = await fetchPosterImageStream(posterUrl);
-    pipePosterImageResponse(res, imageResponse);
+    const isRatingPoster = !customUrl;
+    const bypassed = posterCacheConfig.isBypassed(posterUrl);
+    const allowPrivateHost = customUrl ? proxyArtUrlVouched(customUrl, sig) : true;
+    if (!bypassed && (isRatingPoster ? isProcessedImageCacheEnabled() : posterCacheConfig.isClassEnabled('poster'))) {
+      const posterCacheStore = require('./lib/posterCache/store.js');
+      const { fetchImage } = require('./lib/posterCache/upstream.js');
+      const fetchUpstream = (validators) => fetchImage(posterUrl, { allowPrivateHost, validators });
+      const result = isRatingPoster
+        ? await posterCacheStore.getOrFetch('processed', `rating-poster:${posterUrl}`, (validators) => produceProcessedBytes(posterUrl, () => fetchUpstream(validators)))
+        : await posterCacheStore.getOrFetch('poster', posterUrl, fetchUpstream);
+      return await serveStoreResult(req, res, {
+        imageClass: 'poster',
+        url: posterUrl,
+        result,
+        send: (served) => sendCachedImage(res, served),
+      });
+    }
+
+    const openUpstream = openArtStream({ url: posterUrl, allowPrivateHost, minContentLength: 100 });
+    await servePassThrough(req, res, {
+      imageClass: 'poster',
+      url: posterUrl,
+      bypassed,
+      open: async (validators) => {
+        const imageResponse = await openUpstream(validators);
+        if (bypassed && posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+          require('./lib/posterCache/handler.js').recordServe('poster', 'BYPASS', 0, req.method, posterUrl);
+        }
+        return imageResponse;
+      },
+    });
   } catch (error) {
+    if (posterCacheConfig.isBuiltinPosterCacheEnabled()) require('./lib/posterCache/handler.js').recordServeError();
     const isTimeout = error.code === 'ECONNABORTED' || /timeout/i.test(error.message || '');
+    const status = error.response?.status ?? error.status;
     if (isTimeout) {
       consola.warn(`Poster proxy timed out for ${id}, serving fallback:`, error.message);
+    } else if (status === 404) {
+      consola.debug(`No art for ${id} at the poster provider, serving fallback`);
+    } else if (status === 403) {
+      warnRefusedOrigin(`Poster proxy refused ${id}`, error.message);
     } else {
       consola.error(`Error in poster proxy for ${id}:`, error.message);
     }
-    res.redirect(302, fallback);
+    sendFallback();
   }
-});
+};
+addon.get("/poster/:type/:id", handlePosterProxy);
 
 function streamArtWithFallback(assetName) {
   return async function (req, res) {
-    const { type, id } = req.params;
-    const { fallback, url: customUrl } = req.query;
+    const { id } = req.params;
+    const { fallback, url: customUrl, sig } = req.query;
     if (!customUrl) {
       return res.redirect(302, fallback || '');
     }
-    const etag = crypto.createHash('md5').update(`${assetName}:${type}:${id}:${customUrl}`).digest('hex');
-    res.setHeader('ETag', `"${etag}"`);
-    if (req.headers['if-none-match'] === `"${etag}"`) {
-      return res.status(304).end();
-    }
+    const bypassed = posterCacheConfig.isBypassed(customUrl);
+    // A property of the URL, not of whether we are storing it — see handlePosterProxy.
+    const allowPrivateHost = proxyArtUrlVouched(customUrl, sig);
     try {
-      const imageResponse = await axios({
-        method: 'get',
+      if (posterCacheConfig.isClassEnabled(assetName) && !bypassed) {
+        const posterCacheStore = require('./lib/posterCache/store.js');
+        const { fetchImage } = require('./lib/posterCache/upstream.js');
+        const result = await posterCacheStore.getOrFetch(assetName, customUrl, (validators) =>
+          fetchImage(customUrl, { allowPrivateHost, validators }));
+        return await serveStoreResult(req, res, {
+          imageClass: assetName,
+          url: customUrl,
+          result,
+          send: (served) => sendCachedImage(res, served),
+        });
+      }
+
+      // No size floor here: a 1×1 logo is small but legitimate.
+      const openUpstream = openArtStream({ url: customUrl, allowPrivateHost });
+      await servePassThrough(req, res, {
+        imageClass: assetName,
         url: customUrl,
-        responseType: 'stream',
-        timeout: POSTER_PROXY_TIMEOUT_MS(),
-        validateStatus: (status) => status >= 200 && status < 300,
-        headers: { 'User-Agent': `AIOMetadata/${buildInfo.version}` }
+        bypassed,
+        open: async (validators) => {
+          const imageResponse = await openUpstream(validators);
+          if (bypassed && posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+            require('./lib/posterCache/handler.js').recordServe(assetName, 'BYPASS', 0, req.method, customUrl);
+          }
+          return imageResponse;
+        },
       });
-      const contentType = imageResponse.headers['content-type'];
-      res.setHeader('Content-Type', contentType || 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
-      imageResponse.data.pipe(res);
     } catch (error) {
-      consola.debug(`Art proxy miss for ${assetName} ${id}: ${error.message}`);
+      if (posterCacheConfig.isBuiltinPosterCacheEnabled()) require('./lib/posterCache/handler.js').recordServeError();
+      if (error.status === 403) {
+        warnRefusedOrigin(`Art proxy refused ${assetName} ${id}`, error.message);
+      } else {
+        consola.debug(`Art proxy miss for ${assetName} ${id}: ${error.message}`);
+      }
       if (fallback) {
         return res.redirect(302, fallback);
       }
@@ -4612,6 +5863,16 @@ function streamArtWithFallback(assetName) {
 
 addon.get("/logo/:type/:id", streamArtWithFallback('logo'));
 addon.get("/background/:type/:id", streamArtWithFallback('background'));
+
+addon.get("/poster-cache/proxy/poster/:type/:id", handlePosterProxy);
+addon.get("/poster-cache/proxy/logo/:type/:id", streamArtWithFallback('logo'));
+addon.get("/poster-cache/proxy/background/:type/:id", streamArtWithFallback('background'));
+addon.get("/poster-cache/proxy/landscape/:type/:id", streamArtWithFallback('landscape'));
+
+{
+  const { posterCacheHandler } = require('./lib/posterCache/handler.js');
+  addon.use(posterCacheConfig.POSTER_CACHE_ROUTE, posterCacheHandler());
+}
 
 
 // --- Image Processing Routes ---
@@ -4627,6 +5888,10 @@ addon.get("/api/image/blur", async function (req, res) {
   try {
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    if (isProcessedImageCacheEnabled()) {
+      const result = await cacheProcessedImage(`blur:${imageUrl}`, 'image/jpeg', (sink) => blurImage(imageUrl, sink));
+      return await sendCachedImage(res, result, 'image/jpeg');
+    }
     await blurImage(imageUrl, res);
   } catch (error) {
     consola.error('Error in blur route:', error);
@@ -4656,6 +5921,15 @@ addon.get("/api/image/banner-to-background", async function (req, res) {
     
     res.setHeader('Content-Type', 'image/jpeg');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    if (isProcessedImageCacheEnabled()) {
+      const optionsKey = `${options.width}:${options.height}:${options.blur}:${options.brightness}:${options.contrast}:${options.position}`;
+      const result = await cacheProcessedImage(
+        `b2b:${imageUrl}:${optionsKey}`,
+        'image/jpeg',
+        (sink) => convertBannerToBackground(imageUrl, options, sink)
+      );
+      return await sendCachedImage(res, result, 'image/jpeg');
+    }
     await convertBannerToBackground(imageUrl, options, res);
   } catch (error) {
     consola.error(`Error converting banner to background for ${imageUrl}:`, error.message);
@@ -4666,61 +5940,6 @@ addon.get("/api/image/banner-to-background", async function (req, res) {
     res.status(500).send('Internal server error');
   }
 });
-
-// --- Image Resize Route ---
-addon.get('/resize-image', async function (req, res) {
-  const imageUrl = req.query.url;
-  const fit = req.query.fit || 'cover';
-  const output = req.query.output || 'jpg';
-  const quality = parseInt(req.query.q, 10) || 95;
-
-  if (!imageUrl) {
-    return res.status(400).send('Image URL not provided');
-  }
-
-  // Import the validation function
-  const { validateImageUrl } = require('./utils/imageProcessor');
-  
-  // Validate URL before processing
-  if (!validateImageUrl(imageUrl)) {
-    return res.status(400).send('Invalid or unauthorized image URL');
-  }
-
-  try {
-    const response = await axios.get(imageUrl, { 
-      responseType: 'arraybuffer',
-      timeout: 10000,
-      maxContentLength: 10 * 1024 * 1024, // 10MB limit
-      maxBodyLength: 10 * 1024 * 1024
-    });
-    let transformer = sharp(response.data).resize({
-      width: 1280, // You can adjust or make this configurable
-      height: 720,
-      fit: fit
-    });
-    if (output === 'jpg' || output === 'jpeg') {
-      transformer = transformer.jpeg({ quality });
-      res.setHeader('Content-Type', 'image/jpeg');
-    } else if (output === 'png') {
-      transformer = transformer.png({ quality });
-      res.setHeader('Content-Type', 'image/png');
-    } else if (output === 'webp') {
-      transformer = transformer.webp({ quality });
-      res.setHeader('Content-Type', 'image/webp');
-    } else {
-      return res.status(400).send('Unsupported output format');
-    }
-    const buffer = await transformer.toBuffer();
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    res.send(buffer);
-  } catch (error) {
-    consola.error('Error in resize-image route:', error);
-    res.status(500).send('Error processing image');
-  }
-});
-
-
-
 
 // Support Stremio settings opening under /stremio/:uuid/:config/configure
   addon.get('/stremio/:userUUID/configure', function (req, res) {
@@ -4803,7 +6022,6 @@ addon.get("/stremio/:userUUID/rating", async function (req, res) {
       try {
         // Use the type from URL to look up metadata
         const stremioType = metaType.toLowerCase();
-        const contentKey = `${stremioType}:${id}`;
         
         // Try to get metadata from cache using the canonical key
         const canonicalKey = requestTracker.canonicalContentMetadataKey(stremioType, id);
@@ -4874,10 +6092,19 @@ addon.get("/rating", (req, res) => {
   res.redirect(`/stremio/${user}/rating?${params.toString()}`);
 });
 
+const clientAssetsDir = path.join(clientDistDir, 'assets');
+function setClientDistCacheHeaders(res, filePath) {
+  if (filePath.startsWith(clientAssetsDir + path.sep)) {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  } else if (path.basename(filePath) === 'index.html') {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+}
+
 addon.use(favicon(path.join(publicDir, 'favicon.png')));
-addon.use('/configure', express.static(clientDistDir));
+addon.use('/configure', express.static(clientDistDir, { setHeaders: setClientDistCacheHeaders }));
 addon.use(express.static(publicDir));
-addon.use(express.static(clientDistDir));
+addon.use(express.static(clientDistDir, { setHeaders: setClientDistCacheHeaders }));
 
 // Dedicated Dashboard Page Route
 addon.get("/dashboard", (req, res) => {
@@ -4931,11 +6158,7 @@ addon.get('/api/config/addon-info', (req, res) => {
 });
 
 // --- Admin: Prune all ID mappings ---
-addon.post('/api/admin/prune-id-mappings', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post('/api/admin/prune-id-mappings', requireDashboardAdmin, async (req, res) => {
   try {
     await database.pruneAllIdMappings();
     res.json({ success: true, message: 'All id_mappings pruned.' });
@@ -4947,11 +6170,7 @@ addon.post('/api/admin/prune-id-mappings', async (req, res) => {
 // --- Admin: User Management Endpoints ---
 
 // Get all users with basic info
-addon.get('/api/admin/users', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-       return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get('/api/admin/users', requireDashboardAdmin, async (req, res) => {
   
   try {
     const users = await database.getAllUsersWithStats();
@@ -4963,11 +6182,21 @@ addon.get('/api/admin/users', async (req, res) => {
 });
 
 // Get detailed user information
-addon.get('/api/admin/users/:userUUID', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Export all user data
+addon.get('/api/admin/users/export', requireDashboardAdmin, async (req, res) => {
+  
+  try {
+    const userData = await database.exportAllUserData();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=users-export-${new Date().toISOString().split('T')[0]}.json`);
+    res.json(userData);
+  } catch (error) {
+    consola.error('[Admin API] Error exporting user data:', error);
+    res.status(500).json({ error: 'Failed to export user data' });
   }
+});
+
+addon.get('/api/admin/users/:userUUID', requireDashboardAdmin, async (req, res) => {
   
   try {
     const { userUUID } = req.params;
@@ -4985,11 +6214,7 @@ addon.get('/api/admin/users/:userUUID', async (req, res) => {
 });
 
 // Reset user password
-addon.post('/api/admin/users/:userUUID/reset-password', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post('/api/admin/users/:userUUID/reset-password', requireDashboardAdmin, async (req, res) => {
   
   try {
     const { userUUID } = req.params;
@@ -5007,12 +6232,53 @@ addon.post('/api/admin/users/:userUUID/reset-password', async (req, res) => {
   }
 });
 
-// Delete user
-addon.delete('/api/admin/users/:userUUID', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// Set a user's alias
+addon.put('/api/admin/users/:userUUID/alias', requireDashboardAdmin, async (req, res) => {
+  const { isAliasFeatureEnabled, setAliasForUser } = require('./lib/aliasResolver.js');
+  if (!isAliasFeatureEnabled()) {
+    return res.status(403).json({ error: 'User aliases are disabled on this instance (USER_ALIASES_ENABLED).' });
   }
+
+  try {
+    const { userUUID } = req.params;
+    const { alias } = req.body || {};
+    const result = await setAliasForUser(userUUID, alias);
+
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    res.json({ success: true, alias: result.alias });
+  } catch (error) {
+    consola.error('[Admin API] Error setting alias:', error);
+    res.status(500).json({ error: 'Failed to set alias' });
+  }
+});
+
+// Remove a user's alias
+addon.delete('/api/admin/users/:userUUID/alias', requireDashboardAdmin, async (req, res) => {
+  const { isAliasFeatureEnabled, clearAliasForUser } = require('./lib/aliasResolver.js');
+  if (!isAliasFeatureEnabled()) {
+    return res.status(403).json({ error: 'User aliases are disabled on this instance (USER_ALIASES_ENABLED).' });
+  }
+
+  try {
+    const { userUUID } = req.params;
+    const removed = await clearAliasForUser(userUUID);
+
+    if (!removed) {
+      return res.status(404).json({ error: 'User has no alias' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    consola.error('[Admin API] Error clearing alias:', error);
+    res.status(500).json({ error: 'Failed to clear alias' });
+  }
+});
+
+// Delete user
+addon.delete('/api/admin/users/:userUUID', requireDashboardAdmin, async (req, res) => {
   
   try {
     const { userUUID } = req.params;
@@ -5029,30 +6295,9 @@ addon.delete('/api/admin/users/:userUUID', async (req, res) => {
   }
 });
 
-// Export all user data
-addon.get('/api/admin/users/export', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    const userData = await database.exportAllUserData();
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=users-export-${new Date().toISOString().split('T')[0]}.json`);
-    res.json(userData);
-  } catch (error) {
-    consola.error('[Admin API] Error exporting user data:', error);
-    res.status(500).json({ error: 'Failed to export user data' });
-  }
-});
 
 // Bulk delete inactive users
-addon.post('/api/admin/users/bulk-delete-inactive', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post('/api/admin/users/bulk-delete-inactive', requireDashboardAdmin, async (req, res) => {
   
   try {
     const { days = 30 } = req.body;
@@ -5064,8 +6309,7 @@ addon.post('/api/admin/users/bulk-delete-inactive', async (req, res) => {
   }
 });
 
-// Debug endpoint to help troubleshoot catalog issues
-addon.get("/api/debug/catalogs/:userUUID", async function (req, res) {
+addon.get("/api/debug/catalogs/:userUUID", requireDashboardAdmin, async function (req, res) {
   const { userUUID } = req.params;
   try {
     const config = await database.getUserConfig(userUUID);
@@ -5121,7 +6365,8 @@ addon.delete('/api/config/delete-user/:userUUID', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Verify password
+    // Deleting is irreversible, so the password is asked for again even when the
+    // account already owns this configuration.
     const isValidPassword = await database.verifyPassword(userUUID, password);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid password' });
@@ -5176,25 +6421,6 @@ addon.post('/api/cache/clean-bad', async (req, res) => {
   }
 });
 
-// Get cache health statistics
-addon.get('/api/cache/health', async (req, res) => {
-  try {
-    const { getCacheHealth } = require('./lib/getCache');
-    const health = getCacheHealth();
-    
-    res.json({
-      success: true,
-      health: health
-    });
-  } catch (error) {
-    consola.error('[Cache Health] Error:', error);
-    res.status(500).json({ 
-      error: 'Failed to get cache health',
-      details: error.message 
-    });
-  }
-});
-
 // Test granular caching
 addon.post('/api/cache/test-granular', async (req, res) => {
   try {
@@ -5204,7 +6430,7 @@ addon.post('/api/cache/test-granular', async (req, res) => {
       return res.status(400).json({ error: 'userUUID, metaId, and type are required' });
     }
     
-    const { cacheWrapMetaSmart, reconstructMetaFromComponents } = require('./lib/getCache');
+    const { reconstructMetaFromComponents } = require('./lib/getCache');
     
     // Test reconstruction
     const reconstructed = await reconstructMetaFromComponents(userUUID, metaId, undefined, {}, type);
@@ -5229,22 +6455,16 @@ addon.post('/api/cache/invalidate-user/:userUUID', async (req, res) => {
   try {
     const { userUUID } = req.params;
     const { password } = req.body;
-    
-    if (!userUUID || !password) {
-      return res.status(400).json({ error: 'userUUID and password are required' });
+
+    if (!userUUID) {
+      return res.status(400).json({ error: 'userUUID is required' });
     }
-    
-    // Verify the user exists and password is correct
-    const user = await database.getUser(userUUID);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const isValidPassword = await database.verifyPassword(userUUID, password);
-    if (!isValidPassword) {
+
+    const access = await resolveConfigAccess(req, userUUID, password);
+    if (!access) {
       return res.status(401).json({ error: 'Invalid password' });
     }
-    
+
     // Clear all cache entries for this user (safe SCAN-based deletion)
     const userCachePattern = `*${userUUID}*`;
     const deleted = await deleteKeysByPattern(userCachePattern);
@@ -5275,20 +6495,19 @@ addon.post('/api/cache/invalidate-user/:userUUID', async (req, res) => {
 
 // Get cache invalidation status for a user
 // Test if essential cache keys exist
-addon.get('/api/cache/test-essential', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get('/api/cache/test-essential', requireDashboardAdmin, async (req, res) => {
   
   try {
+    // Jikan and genre lists are raw upstream payloads cached with `upstream`, so
+    // they carry no prefix at all; only the language list is epoch-keyed. (This list
+    // previously prefixed every entry with the addon version and so never matched.)
     const essentialKeys = [
-      `global:${ADDON_VERSION}:jikan-api:anime-genres`,
-      `global:${ADDON_VERSION}:jikan-api:mal-studios`,
-      `global:${ADDON_VERSION}:genre:tmdb:en-US:movie`,
-      `global:${ADDON_VERSION}:genre:tmdb:en-US:series`,
-      `global:${ADDON_VERSION}:genre:tvdb:en-US:series`,
-      `global:${ADDON_VERSION}:languages:en-US`
+      `global:jikan-api:anime-genres`,
+      `global:jikan-api:mal-studios`,
+      `global:genre:tmdb:en-US:movie`,
+      `global:genre:tmdb:en-US:series`,
+      `global:genre:tvdb:en-US:series`,
+      withGlobalEpoch(`languages:en-US`)
     ];
     
     const results = {};
@@ -5315,14 +6534,14 @@ addon.get('/api/cache/test-essential', async (req, res) => {
   }
 });
 
-addon.get('/api/cache/invalidation-status/:userUUID', async (req, res) => {
+addon.get('/api/cache/invalidation-status/:userUUID', requireDashboardAdmin, async (req, res) => {
   try {
     const { userUUID } = req.params;
     
     // Count cache entries for this user
     const userCachePattern = `*${userUUID}*`;
     // Group by cache type
-    const cacheStats = {
+    const cacheStats: any = {
       total: 0,
       byType: {}
     };
@@ -5376,14 +6595,96 @@ const noCache = (req, res, next) => {
 };
 
 // Middleware to require admin authentication for dashboard routes
+function nameList(names) {
+  const shown = names.slice(0, 5).join(', ');
+  return names.length > 5 ? `${shown} and ${names.length - 5} more` : shown;
+}
+
+function describeAdminImpact(impact) {
+  const parts = [];
+  if (impact.signedOut.length > 0) parts.push(`sign out ${nameList(impact.signedOut)}`);
+  if (impact.demoted.length > 0) {
+    parts.push(`take the admin permission away from ${nameList(impact.demoted)}, immediately and without signing them out`);
+  }
+  if (parts.length < 2) return parts.join('');
+  return `${parts.slice(0, -1).join('; ')}; and ${parts[parts.length - 1]}`;
+}
+
+function describeOthers(impact) {
+  const described = describeAdminImpact(impact);
+  return described ? ` It would also ${described}.` : '';
+}
+
+async function describeSelfDemotion(req, key, proposedValue, confirmed) {
+  if (confirmed === true) return null;
+  if (!key || !key.startsWith('OIDC_')) return null;
+
+  const { previewPermissions } = require('./lib/oidc');
+  const { accountsLosingAdmin, emptyAdminImpact } = require('./lib/authRoutes');
+
+  if (previewPermissions([], key, proposedValue).outcome === 'malformed') {
+    return {
+      error: 'This value cannot be read',
+      requiresConfirmation: true,
+      reason: `${key} would be saved but not understood, so no sign-in would be allowed at all until it is fixed, and everyone already signed in would keep the permissions they have now.`,
+    };
+  }
+
+  let others = emptyAdminImpact();
+  try {
+    others = await accountsLosingAdmin(key, proposedValue, req.session?.accountId);
+  } catch (error) {
+    consola.warn(`[Settings] Could not work out who else would lose admin: ${error.message}`);
+  }
+
+  const session = req.session;
+  if (session && Array.isArray(session.groups) && hasPermission(req, 'admin')) {
+    const preview = previewPermissions(session.groups, key, proposedValue);
+
+    if (preview.outcome === 'unconfigured' || preview.outcome === 'refused') {
+      return {
+        error: 'This change would end your own session',
+        requiresConfirmation: true,
+        reason: `Saving ${key} would sign you out of this dashboard. If no ADMIN_KEY is set on this instance you may not be able to get back in.${describeOthers(others)}`,
+      };
+    }
+    if (!preview.permissions.includes('admin')) {
+      return {
+        error: 'This change would remove your own admin access',
+        requiresConfirmation: true,
+        reason: `Saving ${key} would leave your account without the admin permission, so you would lose the dashboard immediately.${describeOthers(others)}`,
+      };
+    }
+  }
+
+  const described = describeAdminImpact(others);
+  if (described) {
+    return {
+      error: 'This change would remove someone else\'s admin access',
+      requiresConfirmation: true,
+      reason: `Saving ${key} would ${described}.`,
+    };
+  }
+
+  return null;
+}
+
 function requireDashboardAdmin(req, res, next) {
+  // A signed-in administrator needs no key. ADMIN_KEY stays the way in when the
+  // identity provider is unreachable or SSO was never set up.
+  if (hasPermission(req, 'admin')) {
+    return next();
+  }
+
   const adminKey = process.env.ADMIN_KEY;
-  
+
   // If ADMIN_KEY is not configured, deny access with specific message
   if (!adminKey) {
-    return res.status(401).json({ 
+    return res.status(401).json({
       error: 'Unauthorized',
-      message: 'ADMIN_KEY environment variable must be configured to access the dashboard'
+      message: isOidcConfigured()
+        ? 'ADMIN_KEY environment variable must be configured to access the dashboard with a key. Sign in with the identity provider instead, using an account holding the admin permission.'
+        : 'ADMIN_KEY environment variable must be configured to access the dashboard, or configure an identity provider to sign in without one.'
     });
   }
   
@@ -5571,7 +6872,7 @@ addon.get("/api/dashboard/operations", requireDashboardAdmin, (req, res) => {
 
 addon.get("/api/dashboard/logs", requireDashboardAdmin, (req, res) => {
   try {
-    const { getLogEntries, getLogTags } = require('./lib/logBuffer.js');
+    const { getLogEntries, getLogTags, getLogServices } = require('./lib/logBuffer.js');
     const afterCursor = req.query.afterCursor ? parseInt(req.query.afterCursor, 10) : 0;
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : 200;
     const { entries, cursor, newestId } = getLogEntries({
@@ -5579,13 +6880,62 @@ addon.get("/api/dashboard/logs", requireDashboardAdmin, (req, res) => {
       level: req.query.level || undefined,
       tag: req.query.tag || undefined,
       search: req.query.search || undefined,
+      service: req.query.service || undefined,
       limit,
     });
-    res.json({ entries, cursor, newestId, tags: getLogTags() });
+    res.json({ entries, cursor, newestId, tags: getLogTags(), services: getLogServices() });
   } catch (error) {
     consola.error('[Dashboard API] Logs error:', error);
     res.status(500).json({ error: 'Failed to fetch logs' });
   }
+});
+
+addon.get("/api/dashboard/logs/stream", requireDashboardAdmin, (req, res) => {
+  const { subscribeToLogs, buildLogFilter, getLogEntries, getBufferStats, getLogQueryMaxEntries } = require('./lib/logBuffer.js');
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const afterCursor = req.query.afterCursor ? parseInt(req.query.afterCursor, 10) : 0;
+  const filterOpts = {
+    level: req.query.level || undefined,
+    tag: req.query.tag || undefined,
+    search: req.query.search || undefined,
+    service: req.query.service || undefined,
+  };
+  const match = buildLogFilter(filterOpts);
+
+  // Replay buffered history after the cursor, then subscribe for live entries.
+  // Both run synchronously with no await between them, so no entry can be pushed
+  // in the gap (single-threaded) — the backfill->live handoff is gapless and
+  // non-overlapping, which lets the client rely on the stream alone (no poll).
+  const replay = getLogEntries({ afterCursor, ...filterOpts, limit: getLogQueryMaxEntries() });
+  for (const entry of replay.entries) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+  res.write(`event: ready\ndata: ${JSON.stringify({ newestId: getBufferStats().newestId })}\n\n`);
+
+  const MAX_SOCKET_BUFFER = 1024 * 1024; // drop rather than buffer unboundedly for a slow client
+  let dropped = 0;
+  const unsubscribe = subscribeToLogs((entry) => {
+    if (!match(entry)) return;
+    if (res.writableLength > MAX_SOCKET_BUFFER) { dropped++; return; }
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  });
+
+  const heartbeat = setInterval(() => {
+    res.write(`: ping${dropped ? ` dropped=${dropped}` : ''}\n\n`);
+  }, 25000);
+  heartbeat.unref?.();
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    res.end();
+  });
 });
 
 addon.get("/api/dashboard/memory", requireDashboardAdmin, (req, res) => {
@@ -5774,8 +7124,53 @@ addon.post("/api/dashboard/cache/clear", requireDashboardAdmin, (req, res) => {
   }
 });
 
+addon.post("/api/dashboard/cache/clear-by-id", requireDashboardAdmin, async (req, res) => {
+  try {
+    const { token, dryRun, includeColdStore } = req.body || {};
+    const result = await getDashboardAPI().clearCacheByToken(token, {
+      dryRun: !!dryRun,
+      // Default on, so existing callers keep the combined behavior.
+      includeColdStore: includeColdStore !== false,
+    });
+    return res.status(result.success ? 200 : 400).json(result);
+  } catch (error) {
+    consola.error('[Dashboard API] Error:', error);
+    return res.status(500).json({ error: 'Failed to clear cache entries' });
+  }
+});
+
 addon.post("/api/dashboard/poster-cache/purge", requireDashboardAdmin, async (req, res) => {
-  const posterCacheUrl = (process.env.POSTER_WARMUP_URL || process.env.POSTER_PROXY_PREFIX_URL || '').replace(/\/+$/, '');
+  const requestedType = req.body?.type;
+  const askedForDomain = typeof req.body?.domain === 'string';
+
+  if (posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+    if (requestedType !== undefined && !posterCacheConfig.isValidImageClass(requestedType)) {
+      return res.status(400).json({ error: `Unknown image type: ${requestedType}` });
+    }
+    try {
+      const posterCacheStore = require('./lib/posterCache/store.js');
+      if (askedForDomain) {
+        try {
+          const status = posterCacheStore.startDomainPurge(req.body.domain);
+          consola.info(`[API] Poster cache domain purge started: ${status.domain}`);
+          return res.status(202).json({ success: true, ...status });
+        } catch (error) {
+          return res.status(400).json({
+            success: false, message: error.message, domain: req.body.domain, removed: 0, freed_bytes: 0,
+          });
+        }
+      }
+      const result = await posterCacheStore.purge(requestedType);
+      consola.info(`[API] Poster cache purge requested via dashboard (${requestedType || 'all'})`);
+      return res.json(result);
+    } catch (error) {
+      consola.error('[API] Poster cache purge failed:', error.message);
+      return res.status(500).json({ error: 'Failed to purge poster cache', details: error.message });
+    }
+  }
+
+  // Standalone nginx proxy (README Option B) — purge over HTTP as before.
+  const posterCacheUrl = posterCacheConfig.getPosterWarmupBase();
   if (!posterCacheUrl) {
     return res.status(400).json({ error: 'No poster cache URL configured' });
   }
@@ -5791,18 +7186,203 @@ addon.post("/api/dashboard/poster-cache/purge", requireDashboardAdmin, async (re
   }
 });
 
+addon.post("/api/dashboard/poster-cache/invalidate-by-id", requireDashboardAdmin, async (req, res) => {
+  if (!posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+    return res.status(400).json({ error: 'The built-in image cache is not enabled' });
+  }
+
+  const id = typeof req.body?.id === 'string' ? req.body.id.trim() : '';
+  if (!id) {
+    return res.status(400).json({ error: 'A media id is required' });
+  }
+
+  try {
+    const posterCacheStore = require('./lib/posterCache/store.js');
+    res.json(await posterCacheStore.invalidateByMediaId(id));
+  } catch (error) {
+    consola.error('[Poster cache] Invalidate by id failed:', error.message);
+    res.status(500).json({ error: 'Failed to clear art for that id' });
+  }
+});
+
+addon.post("/api/dashboard/poster-cache/invalidate", requireDashboardAdmin, async (req, res) => {
+  if (!posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+    return res.status(400).json({ error: 'The built-in image cache is not enabled' });
+  }
+
+  const raw = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+  if (!raw) {
+    return res.status(400).json({ error: 'An image URL is required' });
+  }
+
+  const requestedType = req.body?.type;
+  if (requestedType !== undefined && !posterCacheConfig.isValidImageClass(requestedType)) {
+    return res.status(400).json({ error: `Unknown image type: ${requestedType}` });
+  }
+
+  // Accept a pasted /poster-cache/... URL as readily as the upstream URL itself —
+  // the cache URL is what an admin has in front of them when an image looks wrong.
+  let target = raw;
+  let parsedType = requestedType;
+  const marker = `${posterCacheConfig.POSTER_CACHE_ROUTE}/`;
+  const markerAt = raw.indexOf(marker);
+  if (markerAt >= 0) {
+    const afterMount = raw.slice(markerAt + marker.length - 1);
+    const proxyRoute = /^\/proxy\/(poster|logo|background|landscape)\//.exec(afterMount);
+    if (proxyRoute) {
+      let customUrl = null;
+      try {
+        customUrl = new URL(raw, 'http://addon.invalid').searchParams.get('url');
+      } catch { /* ignore */ }
+      if (!customUrl) {
+        return res.status(400).json({
+          error: 'That art-proxy URL has no url= parameter to refresh. Rating-provider posters are keyed by the generated provider URL — paste that, or clear the Processed Images type.',
+        });
+      }
+      target = customUrl;
+      if (!parsedType) parsedType = proxyRoute[1];
+    } else {
+      const { parsePosterCachePath } = require('./lib/posterCache/handler.js');
+      const parsed = parsePosterCachePath(afterMount);
+      if (!parsed) {
+        return res.status(400).json({ error: 'Could not read an image URL out of that cache URL' });
+      }
+      target = parsed.url;
+      if (!parsedType) parsedType = parsed.imageClass;
+    }
+  }
+
+  try {
+    const posterCacheStore = require('./lib/posterCache/store.js');
+    const result = await posterCacheStore.invalidate(target, parsedType);
+
+    const removed = [...result.removed];
+    let freed = result.freed_bytes;
+    for (const prefix of ['rating-poster', 'logo', 'background']) {
+      const legacy = await posterCacheStore.invalidate(`${prefix}:${target}`, 'processed');
+      if (legacy.removed.length) {
+        if (!removed.includes('processed')) removed.push('processed');
+        freed += legacy.freed_bytes;
+      }
+    }
+
+    consola.info(`[API] Image cache invalidation for ${target} (${removed.join(', ') || 'not cached'})`);
+    res.json({
+      success: true,
+      url: target,
+      removed,
+      freed_bytes: freed,
+      message: removed.length
+        ? `Removed from ${removed.join(', ')}; it will be re-fetched on the next request. Your player may still show its own copy until its cache expires.`
+        : 'That image was not in the cache',
+    });
+  } catch (error) {
+    consola.error('[API] Image cache invalidation failed:', error.message);
+    res.status(500).json({ error: 'Failed to invalidate image', details: error.message });
+  }
+});
+
 addon.get("/api/dashboard/poster-cache/stats", requireDashboardAdmin, async (req, res) => {
-  const posterCacheUrl = (process.env.POSTER_WARMUP_URL || process.env.POSTER_PROXY_PREFIX_URL || '').replace(/\/+$/, '');
+  if (posterCacheConfig.isBuiltinPosterCacheEnabled()) {
+    const posterCacheStore = require('./lib/posterCache/store.js');
+    return res.json({
+      ...posterCacheStore.stats(),
+      enabled_types: posterCacheConfig.getEnabledClasses(),
+      known_providers: posterCacheConfig.KNOWN_ART_PROVIDERS,
+      domain_purge: posterCacheStore.domainPurgeStatus(),
+      provider_policies: posterCacheConfig.parseProviderPolicies(process.env.POSTER_CACHE_PROVIDER_POLICIES) || [],
+      infer_ttl: posterCacheConfig.isInferTtlEnabled(),
+      presets_enabled: posterCacheConfig.arePresetsEnabled(),
+      follow_upstream: posterCacheConfig.followsUpstreamCacheControl(),
+      passthrough_classes: posterCacheConfig.IMAGE_CLASSES.filter(
+        (imageClass) => !posterCacheConfig.isClassEnabled(imageClass)
+      ),
+    });
+  }
+
+  const policyPayload = {
+    builtin: false,
+    known_providers: posterCacheConfig.KNOWN_ART_PROVIDERS,
+    provider_policies: posterCacheConfig.parseProviderPolicies(process.env.POSTER_CACHE_PROVIDER_POLICIES) || [],
+    presets_enabled: posterCacheConfig.arePresetsEnabled(),
+    follow_upstream: posterCacheConfig.followsUpstreamCacheControl(),
+    proxy_max_age_days: posterCacheConfig.getProxyMaxAgeDays(),
+  };
+
+  // Standalone nginx cannot report a per-type breakdown, so `by_type` is absent
+  // here and the dashboard renders only the totals.
+  const posterCacheUrl = posterCacheConfig.getPosterWarmupBase();
   if (!posterCacheUrl) {
-    return res.status(400).json({ error: 'No poster cache URL configured' });
+    return res.json({ ...policyPayload, external: 'none' });
   }
 
   try {
     const response = await fetch(`${posterCacheUrl}/stats`);
-    const stats = await response.json();
-    res.json(stats);
+    if (!response.ok) throw new Error(`Poster cache answered ${response.status}`);
+    const stats: any = await response.json();
+    res.json({ ...policyPayload, ...stats, external: 'ok' });
   } catch (error) {
-    res.status(502).json({ error: 'Failed to reach poster cache', details: error.message });
+    consola.debug(`[API] Poster cache stats unreachable at ${posterCacheUrl}: ${error.message}`);
+    res.json({ ...policyPayload, external: 'unreachable' });
+  }
+});
+
+// --- Meta Cold Store (disk L2 for stable metadata) ---
+// Returns `enabled: false` rather than an error when the feature is off, so the
+// dashboard can render a single explanatory panel instead of an error state.
+addon.get("/api/dashboard/cold-store/stats", requireDashboardAdmin, (req, res) => {
+  try {
+    const metaColdStore = require('./lib/metaColdStore');
+    const stats = metaColdStore.stats();
+    const health = getCacheHealth();
+    res.json({
+      ...stats,
+      configured: metaColdStore.isEnabled(),
+      hits: health.coldStoreHits || 0,
+      misses: health.coldStoreMisses || 0,
+      componentsServed: health.coldStoreComponents || 0,
+    });
+  } catch (error) {
+    consola.error('[API] Cold store stats failed:', error.message);
+    res.status(500).json({ error: 'Failed to read cold store stats', details: error.message });
+  }
+});
+
+addon.post("/api/dashboard/cold-store/purge", requireDashboardAdmin, async (req, res) => {
+  // Omitting `metaId` drops the whole store; passing one drops just that title.
+  const metaId = typeof req.body?.metaId === 'string' ? req.body.metaId.trim() : '';
+  const includeRedis = metaId ? req.body?.includeRedis !== false : false;
+  try {
+    const metaColdStore = require('./lib/metaColdStore');
+    const removed = metaId ? metaColdStore.invalidate(metaId) : metaColdStore.purge();
+
+    let redisRemoved = 0;
+    if (includeRedis) {
+      try {
+        redisRemoved = await getDashboardAPI().clearCacheForMetaId(metaId);
+      } catch (redisErr) {
+        consola.warn(`[API] Cold store purge: Redis clear failed for ${metaId}: ${redisErr.message}`);
+      }
+    }
+
+    consola.info(`[API] Cold store purge via dashboard (${metaId || 'all'}): ${removed} row(s)`
+      + (includeRedis ? `, ${redisRemoved} Redis key(s)` : ''));
+    res.json({ success: true, removed, redisRemoved, metaId: metaId || null });
+  } catch (error) {
+    consola.error('[API] Cold store purge failed:', error.message);
+    res.status(500).json({ error: 'Failed to purge cold store', details: error.message });
+  }
+});
+
+addon.post("/api/dashboard/cold-store/sweep", requireDashboardAdmin, (req, res) => {
+  try {
+    const metaColdStore = require('./lib/metaColdStore');
+    const removed = metaColdStore.sweep();
+    consola.info(`[API] Cold store sweep via dashboard: ${removed} row(s)`);
+    res.json({ success: true, removed });
+  } catch (error) {
+    consola.error('[API] Cold store sweep failed:', error.message);
+    res.status(500).json({ error: 'Failed to sweep cold store', details: error.message });
   }
 });
 
@@ -5963,7 +7543,7 @@ addon.get("/api/dashboard/content", requireAuthUnlessGuestMode, (req, res) => {
           missingMetadata: 0, // TODO: Implement real tracking
           failedMappings: 0,  // TODO: Implement real tracking
           correctionRequests: 0, // TODO: Implement real tracking
-          successRate: parseFloat(100 - stats.errorRate)
+          successRate: parseFloat(String(100 - stats.errorRate))
         }
       });
     }).catch(error => {
@@ -6144,7 +7724,7 @@ addon.post("/api/dashboard/maintenance/execute", requireDashboardAdmin, async (r
       return res.status(400).json({ error: 'Task ID and action are required' });
     }
     
-    let result = { success: false, message: '' };
+    let result: any = { success: false, message: '' };
     
     // Handle maintenance tasks
     if (taskId === 1) { // Clear expired cache entries
@@ -6183,6 +7763,19 @@ addon.post("/api/dashboard/maintenance/execute", requireDashboardAdmin, async (r
         } catch (error) {
           consola.error('[Maintenance Task] Error updating ID Mapper:', error);
           result = { success: false, message: `Failed to update ID Mapper: ${error.message}` };
+        }
+      }
+    } else if (taskId === 12) { // Update animeApi overlay
+      if (action === 'restart' || action === 'enable') {
+        try {
+          const { forceUpdateAnimeApi } = require('./lib/id-mapper');
+          result = await forceUpdateAnimeApi();
+          if (result.success) {
+            result.message = `animeApi overlay updated successfully (${result.count.toLocaleString()} entries)`;
+          }
+        } catch (error) {
+          consola.error('[Maintenance Task] Error updating animeApi overlay:', error);
+          result = { success: false, message: `Failed to update animeApi overlay: ${error.message}` };
         }
       }
     } else if (taskId === 4) { // Update Kitsu-IMDB Mapping
@@ -6246,6 +7839,13 @@ addon.post("/api/dashboard/maintenance/execute", requireDashboardAdmin, async (r
         const { forceRestartWarmup } = require('./lib/comprehensiveCatalogWarmer');
         forceRestartWarmup();
         result = { success: true, message: 'Comprehensive catalog warming started (force restart)' };
+      } else if (action === 'warm-images') {
+        const { forceWarmImages } = require('./lib/comprehensiveCatalogWarmer');
+        forceWarmImages();
+        result = { success: true, message: 'Image warming started, catalog schedule left unchanged' };
+      } else if (action === 'sync-ttl') {
+        const { syncCatalogTtlToSchedule } = require('./lib/comprehensiveCatalogWarmer');
+        result = await syncCatalogTtlToSchedule();
       } else if (action === 'stop') {
         const { stopComprehensiveWarming } = require('./lib/comprehensiveCatalogWarmer');
         result = stopComprehensiveWarming();
@@ -6285,22 +7885,16 @@ addon.post("/api/dashboard/maintenance/execute", requireDashboardAdmin, async (r
 // --- Admin: Settings Management ---
 const settingsService = require('./lib/settingsService');
 
-addon.get('/api/dashboard/settings', (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.get('/api/dashboard/settings', requireDashboardAdmin, (req, res) => {
   res.json({ settings: settingsService.getAllSettings(), canRestart: canUiRestart() });
 });
 
-addon.put('/api/dashboard/settings/:key', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.put('/api/dashboard/settings/:key', requireDashboardAdmin, async (req, res) => {
   try {
-    const { value } = req.body || {};
+    const { value, confirm } = req.body || {};
     if (value === undefined) return res.status(400).json({ error: 'Missing value' });
+    const block = await describeSelfDemotion(req, req.params.key, String(value), confirm);
+    if (block) return res.status(409).json(block);
     await settingsService.setSetting(req.params.key, String(value));
     res.json({ success: true });
   } catch (error) {
@@ -6308,12 +7902,11 @@ addon.put('/api/dashboard/settings/:key', async (req, res) => {
   }
 });
 
-addon.post('/api/dashboard/settings/reset/:key', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post('/api/dashboard/settings/reset/:key', requireDashboardAdmin, async (req, res) => {
   try {
+    const proposed = settingsService.previewSettingValue(req.params.key, null);
+    const block = await describeSelfDemotion(req, req.params.key, proposed, req.body && req.body.confirm);
+    if (block) return res.status(409).json(block);
     await settingsService.resetSetting(req.params.key);
     res.json({ success: true });
   } catch (error) {
@@ -6338,11 +7931,7 @@ addon.get('/api/dashboard/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), bootId: SERVER_BOOT_ID });
 });
 
-addon.post('/api/dashboard/restart', (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-  if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+addon.post('/api/dashboard/restart', requireDashboardAdmin, (req, res) => {
   if (!canUiRestart()) {
     return res.status(400).json({ error: 'UI restart is not available in this environment' });
   }
@@ -6357,9 +7946,14 @@ addon.post('/api/dashboard/restart', (req, res) => {
   }, 500);
 });
 
+addon.use((err, req, res, next) => {
+  if (respondIfSigninRequired(err, res)) return;
+  next(err);
+});
+
 // Blocking startup function that waits for cache warming
 async function startServerWithCacheWarming() {
-  if (ENABLE_CACHE_WARMING) {
+  if (isCacheWarmingEnabled()) {
     consola.info('[Server Startup] Waiting for initial cache warming to complete...');
     const { warmEssentialContent } = require("./lib/cacheWarmer");
     
@@ -6376,4 +7970,7 @@ async function startServerWithCacheWarming() {
   return addon;
 }
 
-module.exports = { addon, startServerWithCacheWarming, getDashboardAPI };
+export {
+  addon, startServerWithCacheWarming, getDashboardAPI, applyImageCachePrefix,
+  startEssentialWarmingSchedules, startMovieLensSyncSchedule,
+};

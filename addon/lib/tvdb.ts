@@ -1,3 +1,4 @@
+const { tvdbLanguageChain, pickArtwork }: any = require('../utils/tvdbLanguage');
 import { config } from 'dotenv';
 config();
 import { cacheWrapTvdbApi, stableStringify } from './getCache.js';
@@ -77,7 +78,7 @@ async function tvdbHttpRequest(url: string, options: any = {}, maxRetries: numbe
 }
 
 const TVDB_API_URL = 'https://api4.thetvdb.com/v4';
-const GLOBAL_TVDB_KEY = process.env.TVDB_API_KEY || process.env.BUILT_IN_TVDB_API_KEY;
+const globalTvdbKey = () => process.env.TVDB_API_KEY || process.env.BUILT_IN_TVDB_API_KEY;
 const TVDB_IMAGE_BASE = 'https://artworks.thetvdb.com/banners/images/';
 
 // Type definitions for TVDB API responses
@@ -471,7 +472,7 @@ const tokenCache = new Map<string, TokenCache>(); // One token per unique TVDB A
 const tokenInflight = new Map<string, Promise<string | null>>(); // Deduplicate concurrent logins per key
 
 async function getAuthToken(apiKey: string | undefined, userUUID: string | null = null): Promise<string | null> {
-  const key = apiKey || GLOBAL_TVDB_KEY;
+  const key = apiKey || globalTvdbKey();
   if (!key) {
     logger.error('TVDB API Key is not configured.');
     return null;
@@ -513,6 +514,16 @@ async function getAuthToken(apiKey: string | undefined, userUUID: string | null 
 
   tokenInflight.set(key, loginPromise);
   return loginPromise;
+}
+
+// A failed login is indistinguishable from "not on TVDB" once it comes back as null,
+// and the meta layer caches that fallback. Throw instead so the caller degrades.
+async function getAuthTokenOrThrow(apiKey: string | undefined, userUUID: string | null = null): Promise<string | null> {
+  const token = await getAuthToken(apiKey, userUUID);
+  if (!token && (apiKey || globalTvdbKey())) {
+    throw new Error('TVDB login failed, no auth token available');
+  }
+  return token;
 }
 
 function _filterTvdbSearchResults(results: TvdbSearchResult[], query: string): TvdbSearchResult[] {
@@ -695,7 +706,7 @@ async function searchCollections(query: string, config: UserConfig): Promise<Tvd
 
 async function getSeriesExtended(seriesId: string, config: UserConfig): Promise<TvdbSeriesExtended | null> {
   return cacheWrapTvdbApi(`series-extended:${seriesId}`, async () => {
-    const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
+    const token = await getAuthTokenOrThrow(config.apiKeys?.tvdb, config.userUUID);
     if (!token) return null;
 
     const url = `${TVDB_API_URL}/series/${seriesId}/extended?meta=translations`;
@@ -717,7 +728,7 @@ async function getSeriesExtended(seriesId: string, config: UserConfig): Promise<
       requestTracker.trackProviderCall('tvdb', responseTime, false);
       
       logger.error(`[getSeriesExtended] Error fetching extended series data for TVDB ID ${seriesId}:`, (error as Error).message);
-      return null; 
+      throw error;
     }
   });
 }
@@ -775,7 +786,7 @@ async function getPersonExtended(personId: string, config: UserConfig): Promise<
 }
 
 async function _fetchEpisodesBySeasonType(tvdbId: string, seasonType: string, language: string, config: UserConfig): Promise<{ episodes: TvdbEpisode[] } | null> {
-  const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
+  const token = await getAuthTokenOrThrow(config.apiKeys?.tvdb, config.userUUID);
   if (!token) return null;
 
   const langCode3 = await to3LetterCode(language, config);
@@ -796,7 +807,7 @@ async function _fetchEpisodesBySeasonType(tvdbId: string, seasonType: string, la
       page++;
     } catch(error) {
       logger.error(`[_fetchEpisodesBySeasonType] Error fetching page ${page} of ${seasonType} episodes for TVDB ID ${tvdbId}:`, (error as Error).message);
-      hasNextPage = false;
+      throw error;
     }
   }
   return { episodes: allEpisodes };
@@ -822,6 +833,17 @@ async function getSeriesEpisodes(tvdbId: string, language: string = 'en-US', sea
     
     return normalizeTvdbSeriesEpisodesForCache(result);
   });
+}
+
+/**
+ * /search/remoteid answers with one object per matched entity, keyed by its kind and
+ * in no set order, so a season can sort ahead of the series it belongs to. Pick the
+ * entity that was asked for rather than whatever landed first.
+ */
+function tvdbIdFromRemoteIdResults(results: any[], type: string): number | null {
+  const key = type === 'movie' ? 'movie' : 'series';
+  const match = (results || []).find((entry: any) => entry?.[key]?.id);
+  return match?.[key]?.id ?? null;
 }
 
 async function findByImdbId(imdbId: string, config: UserConfig): Promise<TvdbSearchResult[]> {
@@ -1134,8 +1156,7 @@ const findArtwork = (artworks, type, lang, config) => {
       || artworks?.find(a => a.type === type)?.image;
   }
   // Otherwise use preferred language fallback
-  return artworks?.find(a => a.type === type && a.language === lang)?.image
-    || artworks?.find(a => a.type === type && a.language === 'eng')?.image
+  return pickArtwork(artworks, type, tvdbLanguageChain(lang), 'image')
     || artworks?.find(a => a.type === type)?.image;
 };
 
@@ -1320,6 +1341,21 @@ async function getCollectionDetails(collectionId: string, config: UserConfig): P
   });
 }
 
+async function getCollectionBySlug(slug: string, config: UserConfig): Promise<TvdbCollection | null> {
+  return cacheWrapTvdbApi(`collection-slug:${slug}`, async () => {
+    const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
+    if (!token) return null;
+    try {
+      const url = `${TVDB_API_URL}/lists/slug/${encodeURIComponent(slug)}`;
+      const response = await tvdbHttpRequest(url, { headers: { 'Authorization': `Bearer ${token}` } });
+      return (response.data as any)?.data || null;
+    } catch (error) {
+      logger.error(`Error fetching TVDB list for slug ${slug}:`, (error as Error).message);
+      return null;
+    }
+  });
+}
+
 async function getCollectionTranslations(collectionId: string, language: string, config: UserConfig): Promise<TvdbCollectionTranslation | null> {
   return cacheWrapTvdbApi(`collection-translations:${collectionId}:${language}`, async () => {
     const token = await getAuthToken(config.apiKeys?.tvdb, config.userUUID);
@@ -1346,6 +1382,7 @@ async function getCollectionTranslations(collectionId: string, language: string,
 }
 
 export {
+  tvdbIdFromRemoteIdResults,
   searchSeries,
   searchMovies,
   searchPeople,
@@ -1373,6 +1410,7 @@ export {
   getMovieLogo,
   getCollectionsList,
   getCollectionDetails,
+  getCollectionBySlug,
   getCollectionTranslations,
   getMemoryStats,
 };
@@ -1390,6 +1428,7 @@ const __privateTvdbCacheNormalizers = tvdbCacheNormalizers;
 
 // CommonJS compatibility
 module.exports = {
+  tvdbIdFromRemoteIdResults,
   searchSeries,
   searchMovies,
   searchPeople,
@@ -1417,6 +1456,7 @@ module.exports = {
   getMovieLogo,
   getCollectionsList,
   getCollectionDetails,
+  getCollectionBySlug,
   getCollectionTranslations,
   getMemoryStats,
   __privateTvdbCacheNormalizers,

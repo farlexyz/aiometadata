@@ -1,14 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { useConfig } from '@/contexts/ConfigContext';
+import { applyDisconnectRemovals, persistIntegrationCredential } from '@/lib/integrationCredentials';
+import { useSave } from '@/contexts/SaveContext';
 import { CatalogConfig } from '@/contexts/config';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
-import { ExternalLink, CheckCircle2, XCircle, Loader2, ChevronDown, Plus, Link2, BarChart3, Bookmark, TrendingUp, Sparkles } from 'lucide-react';
+import { Switch } from '@/components/ui/switch';
+import { ExternalLink, CheckCircle2, XCircle, Loader2, ChevronDown, Plus, Link2, BarChart3, Bookmark, TrendingUp, Sparkles, PlayCircle, Trash2 } from 'lucide-react';
 import { toast } from "sonner";
 import { apiCache } from '@/utils/apiCache';
+import { DeviceAuthCard } from '@/components/DeviceAuthCard';
+import { useDeviceAuth } from '@/hooks/useDeviceAuth';
 
 interface SimklIntegrationProps {
   isOpen: boolean;
@@ -17,16 +22,24 @@ interface SimklIntegrationProps {
 
 export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
   const [simklClientId, setSimklClientId] = useState<string>("");
+  const [simklAuthMode, setSimklAuthMode] = useState<'oauth' | 'pin' | 'both'>('oauth');
   
   useEffect(() => {
     fetch("/api/config")
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (data && data.simkl) setSimklClientId(data.simkl);
+        if (data && (data.simklAuthMode === 'pin' || data.simklAuthMode === 'both' || data.simklAuthMode === 'oauth')) {
+          setSimklAuthMode(data.simklAuthMode);
+        }
       });
   }, []);
 
+  const pinEnabled = simklAuthMode === 'pin' || simklAuthMode === 'both';
+  const oauthEnabled = simklAuthMode === 'oauth' || simklAuthMode === 'both';
+
   const { config, setConfig, auth } = useConfig();
+  const { markConfigPersisted, isDirty } = useSave();
   const [tempTokenId, setTempTokenId] = useState(config.apiKeys?.simklTokenId || "");
   const [isConnected, setIsConnected] = useState(!!config.apiKeys?.simklTokenId);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -107,6 +120,37 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
     toast.info("Complete the authorization in the new window and paste the Token ID below");
   };
 
+  const applyToken = (tokenId: string, connectedUsername: string) => {
+    setUsername(connectedUsername);
+    setTempTokenId(tokenId);
+    setConfig(prev => ({
+      ...prev,
+      apiKeys: {
+        ...prev.apiKeys,
+        simklTokenId: tokenId,
+      },
+    }));
+
+    // Persisted straight away so navigating away cannot lose the connection
+    // and cannot strand the credential row with nothing pointing at it.
+    void persistIntegrationCredential({ provider: 'simkl', tokenId, userUUID: auth.userUUID, password: auth.password, authenticated: auth.authenticated })
+      .then(result => { if (result.error) toast.warning(`Connected, but the link was not saved: ${result.error}`); });
+
+    setIsConnected(true);
+    toast.success(`Connected as @${connectedUsername}`);
+  };
+
+  // No callback URL here, the server talks to Simkl directly while the user
+  // types the code on simkl.com/pin.
+  const pinAuth = useDeviceAuth({
+    startPath: "/api/auth/simkl/pin",
+    statusPath: "/api/auth/simkl/pin/status",
+    cancelPath: "/api/auth/simkl/pin/cancel",
+    active: isOpen,
+    providerLabel: "Simkl",
+    onAuthorized: applyToken,
+  });
+
   const handleSave = async () => {
     if (!tempTokenId.trim()) {
       toast.error("Please enter a valid Token ID");
@@ -124,18 +168,7 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
       if (response.ok) {
         const data = await response.json();
         if (data.provider === 'simkl') {
-          setUsername(data.username);
-          
-          setConfig(prev => ({
-            ...prev,
-            apiKeys: {
-              ...prev.apiKeys,
-              simklTokenId: tempTokenId.trim(),
-            },
-          }));
-
-          setIsConnected(true);
-          toast.success(`Connected as @${data.username}`);
+          applyToken(tempTokenId.trim(), data.username);
         } else {
           toast.error("Invalid Simkl token");
         }
@@ -243,6 +276,75 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
     toast.success(`Added Simkl ${statusDisplayNames[status]} ${type}`);
   };
 
+  const handleAddUpNext = () => {
+    if (!isConnected) {
+      toast.error('Please connect your Simkl account first');
+      return;
+    }
+    setConfig(prev => {
+      const displayType = getDisplayTypeOverride('series', prev.displayTypeOverrides);
+      const newCatalog: CatalogConfig = {
+        id: 'simkl.upnext',
+        type: 'series',
+        name: 'Simkl Up Next',
+        enabled: true,
+        showInHome: true,
+        source: 'simkl' as any,
+        cacheTTL: 300,
+        metadata: { useShowPosterForUpNext: false, includeAnimeInUpNext: true },
+        ...(displayType && { displayType }),
+      };
+      return { ...prev, catalogs: [...prev.catalogs, newCatalog] };
+    });
+    toast.success('Up Next catalog added');
+  };
+
+  const handleRemoveUpNext = () => {
+    setConfig(prev => ({
+      ...prev,
+      catalogs: prev.catalogs.filter(c => c.id !== 'simkl.upnext'),
+    }));
+    toast.success('Up Next catalog removed');
+  };
+
+  const handleAddAnimeUpNext = () => {
+    if (!isConnected) {
+      toast.error('Please connect your Simkl account first');
+      return;
+    }
+    setConfig(prev => {
+      const displayType = getDisplayTypeOverride('anime', prev.displayTypeOverrides);
+      const newCatalog: CatalogConfig = {
+        id: 'simkl.upnext.anime',
+        type: 'anime',
+        name: 'Simkl Anime Up Next',
+        enabled: true,
+        showInHome: true,
+        source: 'simkl' as any,
+        cacheTTL: 300,
+        metadata: { useShowPosterForUpNext: false },
+        ...(displayType && { displayType }),
+      };
+      // Two rows listing the same anime is never what the user wants, so adding
+      // the dedicated row takes anime out of the combined one.
+      const catalogs = prev.catalogs.map(c =>
+        c.id === 'simkl.upnext'
+          ? { ...c, metadata: { ...c.metadata, includeAnimeInUpNext: false } }
+          : c
+      );
+      return { ...prev, catalogs: [...catalogs, newCatalog] };
+    });
+    toast.success('Anime Up Next catalog added');
+  };
+
+  const handleRemoveAnimeUpNext = () => {
+    setConfig(prev => ({
+      ...prev,
+      catalogs: prev.catalogs.filter(c => c.id !== 'simkl.upnext.anime'),
+    }));
+    toast.success('Anime Up Next catalog removed');
+  };
+
   const handleDisconnect = async () => {
     setDisconnecting(true);
     try {
@@ -279,9 +381,14 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
       setTempTokenId("");
       setIsConnected(false);
       setUsername(null);
+      // Reloading dropped the session, which is held in memory only, so the
+      // saved config comes back from the server and is adopted in place.
+      // The server already saved these removals. If nothing else was pending, the page
+      // now matches disk, so the baseline moves with it rather than claiming unsaved work.
+      const next = applyDisconnectRemovals(config, data.removed);
+      setConfig(next);
+      if (isDirty === false) markConfigPersisted(next);
       toast.success("Simkl account disconnected");
-      
-      window.location.reload();
     } catch (error) {
       console.error("Disconnect error:", error);
       toast.error(error instanceof Error ? error.message : "Failed to disconnect Simkl");
@@ -328,24 +435,44 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
                     </div>
                   </div>
 
-                  <div className="space-y-2">
-                    <Label>Step 1: Authorize Simkl</Label>
-                    <Button onClick={handleConnect} className="w-full" disabled={!simklClientId}>
-                      <ExternalLink className="mr-2 h-4 w-4" />
-                      Authorize with Simkl
-                    </Button>
-                    {!simklClientId && (
-                      <p className="text-xs text-red-500 mt-2">
-                        Instance owner has not yet set up the Simkl integration.
+                  {pinEnabled && (
+                    <div className="space-y-2">
+                      <Label>Connect with a PIN</Label>
+                      <DeviceAuthCard
+                        code={pinAuth.code}
+                        requesting={pinAuth.requesting}
+                        disabled={!simklClientId}
+                        startLabel="Get a Simkl PIN"
+                        hint="Opens simkl.com/pin in a new tab. No public callback URL needed."
+                        onStart={pinAuth.start}
+                        onCancel={pinAuth.cancel}
+                      />
+                    </div>
+                  )}
+
+                  {oauthEnabled && (
+                    <div className="space-y-2">
+                      <Label>{pinEnabled ? "Or authorize in a browser window" : "Step 1: Authorize Simkl"}</Label>
+                      <Button onClick={handleConnect} className="w-full" disabled={!simklClientId}>
+                        <ExternalLink className="mr-2 h-4 w-4" />
+                        Authorize with Simkl
+                      </Button>
+                      <p className="text-xs text-muted-foreground">
+                        Opens a new window. You'll receive a Token ID to paste below.
                       </p>
-                    )}
-                    <p className="text-xs text-muted-foreground">
-                      Opens a new window. You'll receive a Token ID to paste below.
+                    </div>
+                  )}
+
+                  {!simklClientId && (
+                    <p className="text-xs text-red-500">
+                      Instance owner has not yet set up the Simkl integration.
                     </p>
-                  </div>
+                  )}
 
                   <div className="space-y-2">
-                    <Label htmlFor="simkl-token">Step 2: Paste Token ID</Label>
+                    <Label htmlFor="simkl-token">
+                      {oauthEnabled ? "Step 2: Paste Token ID" : "Already have a Token ID?"}
+                    </Label>
                     <Input
                       id="simkl-token"
                       placeholder="Paste your Simkl Token ID here"
@@ -688,6 +815,122 @@ export function SimklIntegration({ isOpen, onClose }: SimklIntegrationProps) {
                       </div>
                       <p className="text-xs text-muted-foreground">
                         These catalogs show your Simkl watchlist items by status. Page size must match your SimKL settings.
+                      </p>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="bg-gradient-to-br from-violet-500/10 via-card/80 to-card/80 border-violet-400/20">
+                    <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
+                      <div className="shrink-0 h-10 w-10 rounded-lg bg-violet-500/15 text-violet-300 flex items-center justify-center ring-1 ring-violet-400/20">
+                        <PlayCircle className="h-5 w-5" />
+                      </div>
+                      <div className="flex-1 min-w-0 space-y-1.5">
+                        <CardTitle>Up Next</CardTitle>
+                        <CardDescription>The next episode to watch for every show you have in progress</CardDescription>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <Button
+                          onClick={handleAddUpNext}
+                          variant="outline"
+                          disabled={!isConnected || config.catalogs.some(c => c.id === 'simkl.upnext')}
+                        >
+                          <Plus className="mr-2 h-4 w-4" />
+                          Add Up Next
+                        </Button>
+                        <Button
+                          onClick={handleAddAnimeUpNext}
+                          variant="outline"
+                          disabled={!isConnected || config.catalogs.some(c => c.id === 'simkl.upnext.anime')}
+                        >
+                          <Plus className="mr-2 h-4 w-4" />
+                          Add Anime Up Next
+                        </Button>
+                      </div>
+                      {config.catalogs.some(c => c.id === 'simkl.upnext') && (
+                        <div className="space-y-2 border-t pt-4">
+                          <div className="flex items-center justify-between p-3 border rounded-lg bg-muted/30">
+                            <span className="font-medium">Simkl Up Next</span>
+                            <Button variant="ghost" size="sm" onClick={handleRemoveUpNext}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                          <div className="flex items-center justify-between p-3 border rounded-lg">
+                            <div className="space-y-0.5">
+                              <label className="text-sm font-medium">Use Show Poster</label>
+                              <p className="text-xs text-muted-foreground">Display show poster instead of episode thumbnail</p>
+                            </div>
+                            <Switch
+                              checked={config.catalogs.find(c => c.id === 'simkl.upnext')?.metadata?.useShowPosterForUpNext || false}
+                              onCheckedChange={(checked) => {
+                                setConfig(prev => ({
+                                  ...prev,
+                                  catalogs: prev.catalogs.map(c =>
+                                    c.id === 'simkl.upnext'
+                                      ? { ...c, metadata: { ...c.metadata, useShowPosterForUpNext: checked } }
+                                      : c
+                                  )
+                                }));
+                              }}
+                            />
+                          </div>
+                          <div className="flex items-center justify-between p-3 border rounded-lg">
+                            <div className="space-y-0.5">
+                              <label className="text-sm font-medium">Include Anime</label>
+                              <p className="text-xs text-muted-foreground">
+                                {config.catalogs.some(c => c.id === 'simkl.upnext.anime')
+                                  ? 'Anime has its own row below, so leave this off to avoid listing it twice'
+                                  : 'Mix anime you are watching into the same row'}
+                              </p>
+                            </div>
+                            <Switch
+                              checked={config.catalogs.find(c => c.id === 'simkl.upnext')?.metadata?.includeAnimeInUpNext !== false}
+                              onCheckedChange={(checked) => {
+                                setConfig(prev => ({
+                                  ...prev,
+                                  catalogs: prev.catalogs.map(c =>
+                                    c.id === 'simkl.upnext'
+                                      ? { ...c, metadata: { ...c.metadata, includeAnimeInUpNext: checked } }
+                                      : c
+                                  )
+                                }));
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {config.catalogs.some(c => c.id === 'simkl.upnext.anime') && (
+                        <div className="space-y-2 border-t pt-4">
+                          <div className="flex items-center justify-between p-3 border rounded-lg bg-muted/30">
+                            <span className="font-medium">Simkl Anime Up Next</span>
+                            <Button variant="ghost" size="sm" onClick={handleRemoveAnimeUpNext}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                          <div className="flex items-center justify-between p-3 border rounded-lg">
+                            <div className="space-y-0.5">
+                              <label className="text-sm font-medium">Use Show Poster</label>
+                              <p className="text-xs text-muted-foreground">Display show poster instead of episode thumbnail</p>
+                            </div>
+                            <Switch
+                              checked={config.catalogs.find(c => c.id === 'simkl.upnext.anime')?.metadata?.useShowPosterForUpNext || false}
+                              onCheckedChange={(checked) => {
+                                setConfig(prev => ({
+                                  ...prev,
+                                  catalogs: prev.catalogs.map(c =>
+                                    c.id === 'simkl.upnext.anime'
+                                      ? { ...c, metadata: { ...c.metadata, useShowPosterForUpNext: checked } }
+                                      : c
+                                  )
+                                }));
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      <p className="text-xs text-muted-foreground">
+                        Anime follows your anime metadata provider, so the episode lands on the same page the rest of the addon would open.
                       </p>
                     </CardContent>
                   </Card>

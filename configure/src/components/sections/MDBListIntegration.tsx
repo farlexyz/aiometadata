@@ -8,12 +8,33 @@ import { Switch } from '@/components/ui/switch';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
-import { ChevronDown, Loader2, Plus, Trash2, KeyRound, BarChart3, Settings, PlayCircle, UserSearch, Link2, Bookmark, Sparkles, TrendingUp, Download, Eye, EyeOff } from 'lucide-react';
+import { ChevronDown, Loader2, Plus, Trash2, KeyRound, BarChart3, Settings, PlayCircle, UserSearch, Link2, Bookmark, Sparkles, TrendingUp, Download, Eye, EyeOff, CheckCircle2, ThumbsUp, Search } from 'lucide-react';
+
+const MDBLIST_RECOMMENDED_SECTIONS = [
+  { section: 'recommended', label: 'Recommended For You', description: 'Personalised picks based on your ratings and taste' },
+  { section: 'trending', label: 'Trending In Your Genres', description: "What's gaining traction in the genres you love" },
+  { section: 'similar', label: 'Popular Among Similar Users', description: 'Highly rated by people with similar taste to yours' },
+  { section: 'rising', label: 'Rising', description: 'Global rising items' },
+] as const;
+
+const MDBLIST_RECOMMENDED_VARIANTS = [
+  { suffix: '', type: 'all', label: 'All' },
+  { suffix: '.movies', type: 'movie', label: 'Movies' },
+  { suffix: '.series', type: 'series', label: 'Series' },
+] as const;
 import { toast } from "sonner";
 import { apiCache } from '@/utils/apiCache';
 import { getGenresBySelection, GenreSelection } from '@/data/genres';
 import { getMdbListType, createMDBListCatalog, isDynamicMixedList, createMDBListUnifiedDynamicCatalog } from '@/utils/catalogUtils';
 import type { CatalogConfig } from '@/contexts/ConfigContext';
+import { CacheTTLField } from '@/components/CacheTTLField';
+
+const popularUsers = [
+  { username: 'tvgeniekodi', name: 'Mr. Professor', description: 'Curated TV and movie lists' },
+  { username: 'snoak', name: 'Snoak', description: 'Quality content collections' },
+  { username: 'garycrawfordgc', name: 'Gary Crawford', description: 'Expert curated lists' },
+  { username: 'danaramapyjama', name: 'Dan Pyjama', description: 'Curated film lists for Pyjama wearers' }
+];
 
 interface MDBListIntegrationProps {
   isOpen: boolean;
@@ -21,7 +42,7 @@ interface MDBListIntegrationProps {
 }
 
 export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps) {
-  const { config, setConfig, catalogTTL } = useConfig();
+  const { config, setConfig, catalogTTL, hasBuiltInMdblist } = useConfig();
   const [tempKey, setTempKey] = useState(config.apiKeys.mdblist || "");
   const [showKey, setShowKey] = useState(false);
   const [isValid, setIsValid] = useState(!!config.apiKeys.mdblist);
@@ -33,10 +54,15 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
   const [isLoadingCustomUser, setIsLoadingCustomUser] = useState(false);
   const [defaultSort, setDefaultSort] = useState<'rank' | 'score' | 'usort' | 'score_average' | 'released' | 'releasedigital' | 'imdbrating' | 'imdbvotes' | 'last_air_date' | 'imdbpopular' | 'tmdbpopular' | 'rogerbert' | 'rtomatoes' | 'rtaudience' | 'metacritic' | 'myanimelist' | 'letterrating' | 'lettervotes' | 'budget' | 'revenue' | 'runtime' | 'title' | 'added' | 'random' | 'default'>('default');
   const [defaultOrder, setDefaultOrder] = useState<'asc' | 'desc'>('asc');
-  const [defaultCacheTTL, setDefaultCacheTTL] = useState<number>(catalogTTL);
+  const [defaultCacheTTL, setDefaultCacheTTL] = useState<number | null>(null);
   const [defaultGenreSelection, setDefaultGenreSelection] = useState<GenreSelection>('standard'); // Default to standard genres only
   const [popularLists, setPopularLists] = useState<any[]>([]);
   const [selectedPopularLists, setSelectedPopularLists] = useState<Set<string>>(new Set());
+  const [listSearchQuery, setListSearchQuery] = useState('');
+  const [listSearchResults, setListSearchResults] = useState<any[]>([]);
+  const [isSearchingLists, setIsSearchingLists] = useState(false);
+  const [hasSearchedLists, setHasSearchedLists] = useState(false);
+  const [selectedSearchLists, setSelectedSearchLists] = useState<Set<string>>(new Set());
   const [isLoadingPopularLists, setIsLoadingPopularLists] = useState(false);
   const [topLists, setTopLists] = useState<any[]>([]);
   const [selectedTopLists, setSelectedTopLists] = useState<Set<string>>(new Set());
@@ -49,6 +75,17 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
 
   const [userListSort, setUserListSort] = useState<'ranked' | 'name' | 'created'>('ranked');
   const [watchlistUnified, setWatchlistUnified] = useState<boolean>(true);
+
+  // Public lists resolve against the instance key, so browsing needs no key of your own.
+  // Anything tied to an MDBList account still does, or it would return the instance owner's.
+  const canBrowse = isValid || hasBuiltInMdblist;
+
+  const listsUrl = useCallback((path: string, extra: Record<string, string> = {}) => {
+    const params = new URLSearchParams(extra);
+    if (tempKey.trim()) params.set('apikey', tempKey.trim());
+    const query = params.toString();
+    return query ? `${path}?${query}` : path;
+  }, [tempKey]);
 
   const [dynamicMixedPrompt, setDynamicMixedPrompt] = useState<{
     open: boolean;
@@ -117,7 +154,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               list,
               sort: defaultSort,
               order: defaultOrder,
-              cacheTTL: defaultCacheTTL,
+              cacheTTL: defaultCacheTTL ?? undefined,
               genreSelection: defaultGenreSelection,
               displayTypeOverrides: prev.displayTypeOverrides,
             });
@@ -231,7 +268,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
                 list: { ...list, id: `${list.id}.movies`, name: `${list.name} (Movies)` },
                 sort: defaultSort,
                 order: defaultOrder,
-                cacheTTL: defaultCacheTTL,
+                cacheTTL: defaultCacheTTL ?? undefined,
                 genreSelection: defaultGenreSelection,
                 displayTypeOverrides: prev.displayTypeOverrides,
                 sourceUrl,
@@ -247,7 +284,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
                 list: { ...list, id: `${list.id}.series`, name: `${list.name} (Series)` },
                 sort: defaultSort,
                 order: defaultOrder,
-                cacheTTL: defaultCacheTTL,
+                cacheTTL: defaultCacheTTL ?? undefined,
                 genreSelection: defaultGenreSelection,
                 displayTypeOverrides: prev.displayTypeOverrides,
                 sourceUrl,
@@ -265,7 +302,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
                 list,
                 sort: defaultSort,
                 order: defaultOrder,
-                cacheTTL: defaultCacheTTL,
+                cacheTTL: defaultCacheTTL ?? undefined,
                 genreSelection: defaultGenreSelection,
                 displayTypeOverrides: prev.displayTypeOverrides,
                 sourceUrl,
@@ -291,22 +328,15 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     }
   }, [selectedExternalLists, externalLists, setConfig, defaultSort, defaultOrder, defaultCacheTTL, defaultGenreSelection, externalUnifiedSettings]);
 
-  const popularUsers = [
-    { username: 'tvgeniekodi', name: 'Mr. Professor', description: 'Curated TV and movie lists' },
-    { username: 'snoak', name: 'Snoak', description: 'Quality content collections' },
-    { username: 'garycrawfordgc', name: 'Gary Crawford', description: 'Expert curated lists' },
-    { username: 'danaramapyjama', name: 'Dan Pyjama', description: 'Curated film lists for Pyjama wearers' }
-  ];
-
   const fetchPopularListsFromUser = useCallback(async (username: string, displayName: string) => {
-    if (!tempKey) {
+    if (!canBrowse) {
       toast.error("Please enter your MDBList API key first.");
       return;
     }
 
     setIsLoadingPopularLists(true);
     try {
-      const response = await fetch(`/api/mdblist/lists/user?apikey=${tempKey}&username=${username}&sort=${userListSort}`);
+      const response = await fetch(listsUrl('/api/mdblist/lists/user', { username, sort: userListSort }));
       if (!response.ok) {
         if (response.status === 404) {
           throw new Error(`User "${username}" not found or has no public lists`);
@@ -349,7 +379,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     } finally {
       setIsLoadingPopularLists(false);
     }
-  }, [tempKey]);
+  }, [canBrowse, listsUrl, userListSort]);
 
   const handlePopularListSelection = (listId: string, checked: boolean) => {
     const newSelection = new Set(selectedPopularLists);
@@ -362,14 +392,14 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
   };
 
   const handleImportTopLists = useCallback(async () => {
-    if (!tempKey) {
+    if (!canBrowse) {
       toast.error("Please enter your MDBList API key first.");
       return;
     }
 
     setIsLoadingTopLists(true);
     try {
-      const response = await fetch(`/api/mdblist/lists/top?apikey=${tempKey}`);
+      const response = await fetch(listsUrl('/api/mdblist/lists/top'));
       if (!response.ok) {
         throw new Error("Failed to fetch top lists");
       }
@@ -401,10 +431,10 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     } finally {
       setIsLoadingTopLists(false);
     }
-  }, [tempKey]);
+  }, [canBrowse, listsUrl]);
 
   const fetchCustomUserLists = useCallback(async () => {
-    if (!tempKey) {
+    if (!canBrowse) {
       toast.error("Please enter your MDBList API key first.");
       return;
     }
@@ -416,7 +446,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
 
     setIsLoadingCustomUser(true);
     try {
-      const response = await fetch(`/api/mdblist/lists/user?apikey=${tempKey}&username=${encodeURIComponent(customUsername.trim())}&sort=${userListSort}`);
+      const response = await fetch(listsUrl('/api/mdblist/lists/user', { username: customUsername.trim(), sort: userListSort }));
       if (!response.ok) {
         if (response.status === 404) {
           throw new Error(`User "${customUsername}" not found or has no public lists`);
@@ -450,7 +480,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     } finally {
       setIsLoadingCustomUser(false);
     }
-  }, [tempKey, customUsername]);
+  }, [canBrowse, listsUrl, customUsername, userListSort]);
 
   const handleCustomListSelection = (listId: string, checked: boolean) => {
     const newSelection = new Set(selectedCustomLists);
@@ -485,7 +515,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               list,
               sort: defaultSort,
               order: defaultOrder,
-              cacheTTL: defaultCacheTTL,
+              cacheTTL: defaultCacheTTL ?? undefined,
               genreSelection: defaultGenreSelection,
               displayTypeOverrides: prev.displayTypeOverrides,
             });
@@ -515,6 +545,87 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     }
   }, [selectedCustomLists, customUserLists, customUsername, setConfig, defaultSort, defaultOrder, defaultCacheTTL, defaultGenreSelection]);
 
+  const searchPublicLists = useCallback(async () => {
+    const needle = listSearchQuery.trim();
+    if (!needle) return;
+    if (!canBrowse) {
+      toast.error("Please enter your MDBList API key first.");
+      return;
+    }
+
+    setIsSearchingLists(true);
+    try {
+      const response = await fetch(listsUrl('/api/mdblist/lists/search', { query: needle, limit: '40' }));
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `Search failed (Status: ${response.status})`);
+
+      const results = Array.isArray(data.results) ? data.results : [];
+      setListSearchResults(results);
+      setSelectedSearchLists(new Set());
+      setHasSearchedLists(true);
+      if (results.length === 0) {
+        toast.info("No lists found", { description: `Nothing on MDBList matches "${needle}"` });
+      }
+    } catch (error) {
+      toast.error("List search failed", {
+        description: error instanceof Error ? error.message : "Unknown error occurred"
+      });
+    } finally {
+      setIsSearchingLists(false);
+    }
+  }, [listSearchQuery, canBrowse, listsUrl]);
+
+  const handleSearchListSelection = (listId: string, checked: boolean) => {
+    setSelectedSearchLists(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(listId); else next.delete(listId);
+      return next;
+    });
+  };
+
+  const importSelectedSearchLists = useCallback(async () => {
+    if (selectedSearchLists.size === 0) {
+      toast.error("Please select at least one list to import.");
+      return;
+    }
+
+    try {
+      let added = 0;
+      setConfig(prev => {
+        const newCatalogs = [...prev.catalogs];
+
+        selectedSearchLists.forEach(listId => {
+          const list = listSearchResults.find(l => String(l.id) === String(listId));
+          if (!list) return;
+          if (newCatalogs.some(c => c.id === `mdblist.${list.id}`)) return;
+
+          newCatalogs.push(createMDBListCatalog({
+            list,
+            sort: defaultSort,
+            order: defaultOrder,
+            cacheTTL: defaultCacheTTL ?? undefined,
+            genreSelection: defaultGenreSelection,
+            displayTypeOverrides: prev.displayTypeOverrides,
+          }));
+          added++;
+        });
+
+        return { ...prev, catalogs: newCatalogs };
+      });
+
+      toast.success("Lists imported successfully", {
+        description: added > 0
+          ? `${added} list(s) added to your catalogs`
+          : "Those lists were already in your catalogs"
+      });
+      setSelectedSearchLists(new Set());
+    } catch (error) {
+      toast.error("Failed to import lists", {
+        description: error instanceof Error ? error.message : "Unknown error occurred"
+      });
+    }
+  }, [selectedSearchLists, listSearchResults, setConfig, defaultSort, defaultOrder, defaultCacheTTL, defaultGenreSelection]);
+
   const importSelectedPopularLists = useCallback(async () => {
     if (selectedPopularLists.size === 0) {
       toast.error("Please select at least one list to import.");
@@ -538,7 +649,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               list,
               sort: defaultSort,
               order: defaultOrder,
-              cacheTTL: defaultCacheTTL,
+              cacheTTL: defaultCacheTTL ?? undefined,
               genreSelection: defaultGenreSelection,
               displayTypeOverrides: prev.displayTypeOverrides,
             });
@@ -613,7 +724,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               list,
               sort: defaultSort,
               order: defaultOrder,
-              cacheTTL: defaultCacheTTL,
+              cacheTTL: defaultCacheTTL ?? undefined,
               genreSelection: defaultGenreSelection,
               displayTypeOverrides: prev.displayTypeOverrides,
             });
@@ -698,7 +809,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
           list,
           sort: defaultSort,
           order: defaultOrder,
-          cacheTTL: defaultCacheTTL,
+          cacheTTL: defaultCacheTTL ?? undefined,
           genreSelection: defaultGenreSelection,
           displayTypeOverrides: prev.displayTypeOverrides,
           listUrl,
@@ -730,7 +841,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
         lists,
         username,
         listSlug,
-        cacheTTL: defaultCacheTTL,
+        cacheTTL: defaultCacheTTL ?? undefined,
         genreSelection: defaultGenreSelection,
         displayTypeOverrides: prev.displayTypeOverrides,
         listUrl,
@@ -748,7 +859,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
   };
 
   const handleAddCustomList = async () => {
-    if (!tempKey) {
+    if (!canBrowse) {
         toast.error("Please enter your MDBList API key first.");
         return;
     }
@@ -761,7 +872,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
       const username = parts[1];
       const listname = parts.slice(2).join('/');
 
-      const response = await fetch(`/api/mdblist/lists/${encodeURIComponent(username)}/${encodeURIComponent(listname)}?apikey=${tempKey}`);
+      const response = await fetch(listsUrl(`/api/mdblist/lists/${encodeURIComponent(username)}/${encodeURIComponent(listname)}`));
       if (!response.ok) throw new Error(`Error fetching list (Status: ${response.status})`);
 
       const lists = await response.json();
@@ -790,6 +901,41 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
     }
   };
 
+  const isRecommendedCatalogAdded = (section: string, suffix: string = '') =>
+    config.catalogs.some(c => c.id === `mdblist.recommended.${section}${suffix}`);
+
+  const toggleRecommendedCatalog = (
+    section: string,
+    label: string,
+    variant: typeof MDBLIST_RECOMMENDED_VARIANTS[number] = MDBLIST_RECOMMENDED_VARIANTS[0]
+  ) => {
+    const catalogId = `mdblist.recommended.${section}${variant.suffix}`;
+    if (isRecommendedCatalogAdded(section, variant.suffix)) {
+      setConfig(prev => ({
+        ...prev,
+        catalogs: prev.catalogs.filter(c => c.id !== catalogId),
+      }));
+      toast.success(`Removed "${label}" ${variant.label.toLowerCase()} catalog`);
+    } else {
+      const newCatalog: CatalogConfig = {
+        id: catalogId,
+        type: variant.type,
+        name: variant.suffix ? `${label} (${variant.label})` : label,
+        enabled: true,
+        showInHome: true,
+        source: 'mdblist',
+        cacheTTL: defaultCacheTTL ?? undefined,
+        enableRatingPosters: true,
+        metadata: {}
+      };
+      setConfig(prev => ({
+        ...prev,
+        catalogs: [...prev.catalogs, newCatalog],
+      }));
+      toast.success(`Added "${label}" ${variant.label.toLowerCase()} catalog`);
+    }
+  };
+
   const handleImportWatchlist = async () => {
     if (!tempKey) {
       toast.error("Please enter your MDBList API key first.");
@@ -809,7 +955,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
           sourceUrl: `https://api.mdblist.com/watchlist/items?unified=true`,
           sort: defaultSort,
           order: defaultOrder,
-          cacheTTL: defaultCacheTTL,
+          cacheTTL: defaultCacheTTL ?? undefined,
           genreSelection: defaultGenreSelection,
           enableRatingPosters: true,
           metadata: {}
@@ -856,7 +1002,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
             sourceUrl: `https://api.mdblist.com/watchlist/items?unified=false`,
             sort: defaultSort,
             order: defaultOrder,
-            cacheTTL: defaultCacheTTL,
+            cacheTTL: defaultCacheTTL ?? undefined,
             genreSelection: defaultGenreSelection,
             enableRatingPosters: true,
             ...(movieDisplayType && { displayType: movieDisplayType }),
@@ -873,7 +1019,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
             sourceUrl: `https://api.mdblist.com/watchlist/items?unified=false`,
             sort: defaultSort,
             order: defaultOrder,
-            cacheTTL: defaultCacheTTL,
+            cacheTTL: defaultCacheTTL ?? undefined,
             genreSelection: defaultGenreSelection,
             enableRatingPosters: true,
             ...(seriesDisplayType && { displayType: seriesDisplayType }),
@@ -968,7 +1114,9 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               <div className="flex-1 min-w-0 space-y-1.5">
                 <CardTitle>MDBList API Key</CardTitle>
                 <CardDescription>
-                  Enter your MDBList API key to access public and private lists
+                  {hasBuiltInMdblist
+                    ? "This instance supplies a key, so public lists work without one. Add your own to reach your watchlist, your lists and recommendations."
+                    : "Enter your MDBList API key to access public and private lists"}
                 </CardDescription>
               </div>
             </CardHeader>
@@ -976,7 +1124,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
               <div className="space-y-2">
                 <Label htmlFor="mdblistkey">API Key</Label>
                 <div className="flex items-center space-x-2">
-                  <Input id="mdblistkey" type={showKey ? 'text' : 'password'} value={tempKey} onChange={(e) => setTempKey(e.target.value)} placeholder="Enter your MDBList API key" />
+                  <Input id="mdblistkey" type={showKey ? 'text' : 'password'} value={tempKey} onChange={(e) => setTempKey(e.target.value)} placeholder={hasBuiltInMdblist ? "Optional for public lists" : "Enter your MDBList API key"} />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -1121,7 +1269,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
             </Card>
           )}
 
-          {isValid && (
+          {canBrowse && (
             <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
               <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
                 <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
@@ -1189,28 +1337,14 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
                   )}
                 </div>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="default-cache-ttl">Default Cache TTL (seconds)</Label>
-                <div className="flex items-center space-x-2">
-                  <input
-                    id="default-cache-ttl"
-                    type="number"
-                    value={defaultCacheTTL}
-                    onChange={(e) => setDefaultCacheTTL(parseInt(e.target.value) || catalogTTL)}
-                    min="300"
-                    max="604800"
-                    step="3600"
-                    className="flex-1 px-3 py-2 border border-input bg-background rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent"
-                    placeholder={catalogTTL.toString()}
-                  />
-                  <span className="text-sm text-muted-foreground whitespace-nowrap">
-                    ({Math.floor(defaultCacheTTL / 3600)}h {Math.floor((defaultCacheTTL % 3600) / 60)}m)
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  How long to cache newly added lists before refreshing. Range: 5 minutes to 7 days.
-                </p>
-              </div>
+              <CacheTTLField
+                id="default-cache-ttl"
+                label="Default Cache TTL (seconds)"
+                value={defaultCacheTTL}
+                onChange={setDefaultCacheTTL}
+                min={300}
+                help="How long to cache newly added lists before refreshing. Range: 5 minutes to 7 days."
+              />
               <div className="space-y-2">
                 <Label htmlFor="genre-selection">Default Genre Selection</Label>
                 <Select value={defaultGenreSelection} onValueChange={(value: GenreSelection) => setDefaultGenreSelection(value)}>
@@ -1318,7 +1452,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
           )}
 
           {/* Custom User Lists Section */}
-          {isValid && (
+          {canBrowse && (
             <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
               <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
                 <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
@@ -1453,8 +1587,118 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
             </Card>
           )}
 
+          {/* Search Public Lists */}
+          {canBrowse && (
+            <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
+              <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
+                <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
+                  <Search className="h-5 w-5" />
+                </div>
+                <div className="flex-1 min-w-0 space-y-1.5">
+                  <CardTitle>Search Public Lists</CardTitle>
+                  <CardDescription>
+                    Search every public list on MDBList by name, when you do not know whose list it is.
+                  </CardDescription>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:space-x-2 sm:gap-0">
+                  <Input
+                    id="mdblistListSearch"
+                    value={listSearchQuery}
+                    onChange={(e) => setListSearchQuery(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') searchPublicLists(); }}
+                    placeholder="Search public MDBList lists"
+                    className="min-w-0"
+                  />
+                  <Button
+                    onClick={searchPublicLists}
+                    variant="outline"
+                    disabled={isSearchingLists || !listSearchQuery.trim()}
+                    className="w-full sm:w-auto"
+                  >
+                    {isSearchingLists ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Search'}
+                  </Button>
+                </div>
+
+                {listSearchResults.length > 0 && (
+                  <div className="space-y-3">
+                    <div className="flex items-center space-x-3 p-3 border rounded-lg bg-muted/30">
+                      <Switch
+                        id="select-all-search"
+                        checked={selectedSearchLists.size === listSearchResults.length && listSearchResults.length > 0}
+                        onCheckedChange={(checked) => {
+                          if (checked) {
+                            setSelectedSearchLists(new Set(listSearchResults.map(l => String(l.id))));
+                          } else {
+                            setSelectedSearchLists(new Set());
+                          }
+                        }}
+                      />
+                      <Label htmlFor="select-all-search" className="font-medium cursor-pointer">
+                        Select all results
+                      </Label>
+                      <Badge variant="outline" className="ml-auto">
+                        {selectedSearchLists.size}/{listSearchResults.length}
+                      </Badge>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3 max-h-80 overflow-y-auto border rounded-lg p-3 bg-muted/20">
+                      {listSearchResults.map((list) => (
+                        <div key={list.id} className="flex items-start space-x-3 p-3 border rounded-lg">
+                          <Switch
+                            id={`search-list-${list.id}`}
+                            checked={selectedSearchLists.has(String(list.id))}
+                            onCheckedChange={(checked) => handleSearchListSelection(String(list.id), checked)}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <Label htmlFor={`search-list-${list.id}`} className="font-medium cursor-pointer break-words">
+                              {list.name}
+                            </Label>
+                            <div className="flex flex-wrap items-center gap-2 mt-1">
+                              <Badge variant="outline" className="text-xs">
+                                {getMdbListType(list) === 'all' ? 'Movies and series' : getMdbListType(list) === 'movie' ? 'Movies' : 'Series'}
+                              </Badge>
+                              {(list.user_name || list.user) && (
+                                <Badge variant="secondary" className="text-xs">
+                                  by {list.user_name || list.user}
+                                </Badge>
+                              )}
+                              {list.items ? (
+                                <Badge variant="secondary" className="text-xs">
+                                  {list.items} items
+                                </Badge>
+                              ) : null}
+                            </div>
+                            {list.description && (
+                              <p className="text-xs text-muted-foreground mt-1 line-clamp-2">
+                                {list.description}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {selectedSearchLists.size > 0 && (
+                      <Button onClick={importSelectedSearchLists} className="w-full">
+                        Import {selectedSearchLists.size} Selected List{selectedSearchLists.size !== 1 ? 's' : ''}
+                      </Button>
+                    )}
+                  </div>
+                )}
+
+                {hasSearchedLists && listSearchResults.length === 0 && !isSearchingLists && (
+                  <p className="text-xs text-muted-foreground">
+                    No lists matched that search.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           {/* Legacy: Add Single List by URL */}
-          {isValid && (
+          {canBrowse && (
             <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
               <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
                 <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
@@ -1527,8 +1771,60 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
             </Card>
           )}
 
-          {/* Popular Lists Section */}
+          {/* Recommendations Section */}
           {isValid && (
+            <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
+              <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
+                <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
+                  <ThumbsUp className="h-5 w-5" />
+                </div>
+                <div className="flex-1 min-w-0 space-y-1.5">
+                  <CardTitle>Recommendations</CardTitle>
+                  <CardDescription>
+                    Add MDBList recommendation feeds as catalogs. Personalised sections require MDBList supporter access with recommendations enabled at mdblist.com/preferences; "Rising" works for everyone.
+                  </CardDescription>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  {MDBLIST_RECOMMENDED_SECTIONS.map(({ section, label, description }) => {
+                    const anyAdded = MDBLIST_RECOMMENDED_VARIANTS.some(v => isRecommendedCatalogAdded(section, v.suffix));
+                    return (
+                      <div key={section} className="flex flex-wrap items-center justify-between gap-3 p-3 border rounded-lg bg-muted/30">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium truncate">{label}</span>
+                            {anyAdded && <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />}
+                          </div>
+                          <p className="text-xs text-muted-foreground truncate">{description}</p>
+                        </div>
+                        <div className="flex shrink-0 gap-1.5">
+                          {MDBLIST_RECOMMENDED_VARIANTS.map((variant) => {
+                            const added = isRecommendedCatalogAdded(section, variant.suffix);
+                            return (
+                              <Button
+                                key={variant.label}
+                                variant={added ? "destructive" : "outline"}
+                                size="sm"
+                                onClick={() => toggleRecommendedCatalog(section, label, variant)}
+                                title={added ? `Remove the ${variant.label.toLowerCase()} catalog` : `Add a ${variant.label.toLowerCase()} catalog`}
+                              >
+                                {added ? <Trash2 className="h-4 w-4 mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
+                                {variant.label}
+                              </Button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Popular Lists Section */}
+          {canBrowse && (
             <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
               <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
                 <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
@@ -1660,7 +1956,7 @@ export function MDBListIntegration({ isOpen, onClose }: MDBListIntegrationProps)
           )}
 
           {/* Top Lists Section */}
-          {isValid && (
+          {canBrowse && (
             <Card className="bg-gradient-to-br from-sky-500/10 via-card/80 to-card/80 border-sky-400/20">
               <CardHeader className="flex-row items-start gap-3 sm:gap-4 space-y-0 p-4 sm:p-6">
                 <div className="shrink-0 h-10 w-10 rounded-lg bg-sky-500/15 text-sky-300 flex items-center justify-center ring-1 ring-sky-400/20">
